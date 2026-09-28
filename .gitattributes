@@ -1,0 +1,5 @@
+*.exe binary
+*.dmg binary
+*.ico binary
+*.png binary
+*.sh text eol=lf

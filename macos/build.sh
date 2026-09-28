@@ -1,7 +1,7 @@
 #!/bin/bash
 # Сборка для macOS: bash build.sh   (только Apple Silicon: ARCHS=arm64 bash build.sh)
 # Нужны Xcode или Command Line Tools:  xcode-select --install
-# Результат: build/AiLimitWidget.app (Apple Silicon + Intel) и build/AiLimitWidget.zip
+# Результат: build/AiLimitWidget.app (Apple Silicon + Intel) и build/AiLimitWidget.zip и ../release/AiLimitWidget.dmg (его коммитят в git)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -68,7 +68,11 @@ PLIST
     # подпись «для себя» (ad-hoc): без неё Apple Silicon не запустит программу
     codesign --force --deep --sign - "$APP"
     ditto -c -k --keepParent "$APP" "build/$NAME.zip"
-    echo "    готово: $APP"
+    # DMG для раздачи: лежит в release/ рядом с .exe для Windows (коммитится в git)
+    mkdir -p ../release
+    rm -f "../release/$NAME.dmg"
+    hdiutil create -volname "$DISPLAY" -srcfolder "$APP" -ov -format UDZO "../release/$NAME.dmg" >/dev/null
+    echo "    готово: $APP и release/$NAME.dmg"
 }
 
 build_app AiLimitWidget com.asror.AiLimitWidget "Лимиты ИИ" \

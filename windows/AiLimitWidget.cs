@@ -568,8 +568,8 @@ namespace AiLimitWidget
 
         static ExtraResult Copilot()
         {
-            bool hasApp = CopilotDirs.Any(Directory.Exists);
-            string token = hasApp ? CopilotToken() : null;
+            // папок Copilot может не быть (VS Code хранит вход у себя) — тогда вход берём из gh
+            string token = CopilotToken();
             if (token == null) return new ExtraResult { SignedIn = false };
             string text;
             int code = Http("https://api.github.com/copilot_internal/user", "GET", new Dictionary<string, string> {

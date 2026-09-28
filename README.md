@@ -34,9 +34,9 @@
 | Claude Code | связка ключей (`Claude Code-credentials`), иначе `~/.claude/.credentials.json` | `%USERPROFILE%\.claude\.credentials.json` |
 | Antigravity (Gemini, Claude, GPT) | `agy -p /quota --output-format json` — квота не тратится; `agy` ищется в PATH из `~/.zshrc` | то же |
 | Codex | `~/.codex/auth.json` | `%USERPROFILE%\.codex\auth.json` |
-| Gemini CLI | `~/.gemini/oauth_creds.json` (вход через Google); суточные лимиты Pro и Flash | — |
-| GitHub Copilot | Copilot CLI (связка ключей `copilot-cli` или `~/.copilot`), плагин Copilot (`~/.config/github-copilot`) или `gh auth token`; месячные лимиты | — |
-| Cursor | `~/Library/Application Support/Cursor/…/state.vscdb`; расход за месяц подписки | — |
+| Gemini CLI | `~/.gemini/oauth_creds.json` (вход через Google); суточные лимиты Pro и Flash | `%USERPROFILE%\.gemini\oauth_creds.json` |
+| GitHub Copilot | Copilot CLI (связка ключей `copilot-cli` или `~/.copilot`), плагин Copilot (`~/.config/github-copilot`) или `gh auth token`; месячные лимиты | Copilot CLI (диспетчер учётных данных или `%USERPROFILE%\.copilot`), плагин Copilot (`%LOCALAPPDATA%\github-copilot`) или `gh auth token` |
+| Cursor | `~/Library/Application Support/Cursor/…/state.vscdb`; расход за месяц подписки | `%APPDATA%\Cursor\User\globalStorage\state.vscdb` (читается без sqlite3) |
 
 Выход из Antigravity на Mac открывает Терминал с `agy -i /logout` (macOS может спросить разрешение управлять Терминалом).
 

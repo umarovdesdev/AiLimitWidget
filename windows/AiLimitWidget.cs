@@ -1,4 +1,4 @@
-// Виджет «Лимиты ИИ» для Windows 10 / 11 — лимиты Claude Code и Antigravity CLI в одном окне.
+// Виджет «Лимиты ИИ» для Windows 10 / 11 — лимиты Claude Code, Antigravity CLI, Codex и других ИИ (класс Extra) в одном окне.
 // Claude: те же данные, что /usage в Claude Code; токен из %USERPROFILE%\.claude\.credentials.json (только читаем).
 // Antigravity: «agy -p /quota --output-format json» — бесплатная команда, без обращения к модели и без расхода квоты.
 // Вырос из ClaudeLimitWidget. Сборка: build.cmd (компилятор C# из .NET Framework 4). Код на C# 5.
@@ -36,8 +36,9 @@ namespace AiLimitWidget
         public bool KeepOpen, Notify = true, ClockLabel = true;   // KeepOpen — не скрывать окно при нажатии мимо; ClockLabel — «Сессия: 27%» у часов
         public bool ShowClaude = true, ShowAgy = true, ShowCodex = true;   // какие сервисы показывать
         public bool ShowDetails;                                   // развёрнуты ли подробности (аккаунт, на что ушла неделя)
-        public string ClockItems = "claude,gemini,3p,codex";       // что показывать у часов: claude, gemini (Antigravity), 3p (Claude и GPT в Antigravity), codex
-        public int ClockVersion;                                   // 2 — в ClockItems уже учтён столбец codex
+        public string ClockItems = "claude,gemini,3p,codex,geminicli,copilot,cursor";   // что показывать у часов: claude, gemini (Antigravity), 3p (Claude и GPT в Antigravity), codex, другие ИИ
+        public int ClockVersion;                                   // 2 — в ClockItems уже учтён столбец codex, 3 — столбцы других ИИ
+        public string HiddenExtras = "";                           // другие ИИ (Gemini CLI, Copilot, Cursor), которые выключили в «Показывать»
         public string LoggedOut = "";                              // сервисы, скрытые из-за выхода: вернутся сами, когда в них снова войдут
     }
 
@@ -166,6 +167,620 @@ namespace AiLimitWidget
         }
     }
 
+    // Другие ИИ, кроме Claude Code, Antigravity и Codex: появляются в окне сами, как только на компьютере
+    // есть вход в них, и пропадают, если входа нет. У каждого свой цвет.
+    sealed class ExtraProvider
+    {
+        public string Key, Name;
+        public Color Color;
+        public readonly List<Limit> Limits = new List<Limit>();   // по возрастанию окна: у часов сверху — первый, снизу — последний
+        public string Plan = "", Email, Status = "";
+        public bool StatusIsError, SignedIn, Fetching;              // SignedIn — есть вход, раздел показываем
+        public DateTime? UpdatedAt;
+        public DateTime NextFetch = DateTime.MinValue;
+
+        public Limit Short { get { return Limits.FirstOrDefault(); } }
+        public Limit Long { get { return Limits.Count > 1 ? Limits[Limits.Count - 1] : null; } }
+    }
+
+    // результат одного запроса: SignedIn = false — входа нет, раздел прячем
+    sealed class ExtraResult
+    {
+        public bool SignedIn = true;
+        public readonly List<Limit> Limits = new List<Limit>();
+        public string Plan = "", Email, Problem;
+        public int RetryAfterSeconds;
+    }
+
+    // Gemini CLI: вход из ~/.gemini/oauth_creds.json, лимиты — тот же запрос, что /stats в самом Gemini CLI.
+    // GitHub Copilot: вход Copilot CLI (диспетчер учётных данных или ~/.copilot), плагина Copilot или gh; месячный лимит премиум-запросов.
+    // Cursor: вход из базы Cursor (state.vscdb), расход за текущий месяц подписки.
+    // Входы только читаем: обновлённый токен Gemini держим в памяти и в файл не пишем. Всё вызывается из фонового потока.
+    static class Extra
+    {
+        public static readonly string[][] All = {
+            new[] { "geminicli", "Gemini CLI", "#8AB4F8" },   // голубой
+            new[] { "copilot", "GitHub Copilot", "#BF5AF2" }, // фиолетовый
+            new[] { "cursor", "Cursor", "#40C8E0" }           // бирюзовый
+        };
+
+        static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+        static string Home { get { return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile); } }
+
+        public static ExtraResult Fetch(string key)
+        {
+            switch (key)
+            {
+                case "geminicli": return Gemini();
+                case "copilot": return Copilot();
+                case "cursor": return Cursor();
+                default: return new ExtraResult { SignedIn = false };
+            }
+        }
+
+        // ---------- JSON ----------
+        static Dictionary<string, object> Parse(string text)
+        {
+            try { return string.IsNullOrEmpty(text) ? null : new JavaScriptSerializer().DeserializeObject(text) as Dictionary<string, object>; }
+            catch (Exception) { return null; }
+        }
+
+        static Dictionary<string, object> File(string path)
+        {
+            try { return System.IO.File.Exists(path) ? Parse(System.IO.File.ReadAllText(path, Encoding.UTF8)) : null; }
+            catch (Exception) { return null; }
+        }
+
+        static object Get(Dictionary<string, object> d, string key)
+        {
+            object v;
+            return d != null && d.TryGetValue(key, out v) ? v : null;
+        }
+
+        static Dictionary<string, object> Obj(Dictionary<string, object> d, string key) { return Get(d, key) as Dictionary<string, object>; }
+
+        static string Str(object v)
+        {
+            if (v is string) return (string)v;
+            if (v is int || v is long || v is decimal || v is double) return Convert.ToString(v, Inv);
+            return null;
+        }
+
+        static double? Num(object v)
+        {
+            if (v is int || v is long || v is decimal || v is double) return Convert.ToDouble(v, Inv);
+            double d;
+            if (v is string && double.TryParse((string)v, NumberStyles.Float, Inv, out d)) return d;
+            return null;
+        }
+
+        static bool? Bool(object v) { return v is bool ? (bool?)(bool)v : null; }
+
+        static DateTime? Time(object v)
+        {
+            DateTimeOffset t;
+            string s = v as string;
+            if (!string.IsNullOrEmpty(s) && DateTimeOffset.TryParse(s, Inv, DateTimeStyles.None, out t)) return t.LocalDateTime;
+            return null;
+        }
+
+        // «2025-11-01» — дата сброса в UTC
+        static DateTime? Day(string s)
+        {
+            DateTime d;
+            if (string.IsNullOrEmpty(s) || s.Length < 10) return null;
+            if (!DateTime.TryParseExact(s.Substring(0, 10), "yyyy-MM-dd", Inv, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out d)) return null;
+            return d.ToLocalTime();
+        }
+
+        // средняя часть JWT — там почта, срок и пользователь
+        static Dictionary<string, object> Claims(string jwt)
+        {
+            try
+            {
+                string[] parts = (jwt ?? "").Split('.');
+                if (parts.Length < 2) return null;
+                string p = parts[1].Replace('-', '+').Replace('_', '/');
+                p = p.PadRight(p.Length + (4 - p.Length % 4) % 4, '=');
+                return Parse(Encoding.UTF8.GetString(Convert.FromBase64String(p)));
+            }
+            catch (Exception) { return null; }
+        }
+
+        static string Capital(string s) { return string.IsNullOrEmpty(s) ? "" : char.ToUpper(s[0], Inv) + s.Substring(1); }
+
+        static double Clamp(double v) { return Math.Max(0, Math.Min(100, v)); }
+
+        // ---------- HTTP (в фоне) ----------
+        static int Http(string url, string method, Dictionary<string, string> headers, string body, out string text)
+        {
+            text = null;
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = method;
+                req.Timeout = 30000;
+                req.ReadWriteTimeout = 30000;
+                req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+                foreach (var h in headers)
+                {
+                    if (h.Key == "Content-Type") req.ContentType = h.Value;
+                    else if (h.Key == "Accept") req.Accept = h.Value;
+                    else if (h.Key == "User-Agent") req.UserAgent = h.Value;
+                    else req.Headers[h.Key] = h.Value;
+                }
+                if (body != null)
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes(body);
+                    req.ContentLength = bytes.Length;
+                    using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
+                }
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                {
+                    text = ReadBody(resp);
+                    return (int)resp.StatusCode;
+                }
+            }
+            catch (WebException e)
+            {
+                var resp = e.Response as HttpWebResponse;
+                if (resp == null) return 0;
+                using (resp)
+                {
+                    try { text = ReadBody(resp); } catch (Exception) { }
+                    return (int)resp.StatusCode;
+                }
+            }
+            catch (Exception) { return 0; }
+        }
+
+        static string ReadBody(HttpWebResponse resp)
+        {
+            using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) return sr.ReadToEnd();
+        }
+
+        static bool Ok(int code) { return code >= 200 && code < 300; }
+
+        static ExtraResult Problem(string service, int code)
+        {
+            var r = new ExtraResult();
+            if (code == 401 || code == 403) r.Problem = "Вход " + service + " устарел — откройте " + service + ", он обновит его сам";
+            else if (code == 429) { r.Problem = "Сервер просит подождать — повторю через 5 мин"; r.RetryAfterSeconds = 300; }
+            else r.Problem = code >= 300 ? "Ошибка сервера " + service + " (" + code + ")" : "Нет соединения — повторю позже";
+            return r;
+        }
+
+        // выполнить программу без окна и дождаться вывода; null — не запустилась или не ответила
+        static string Run(string exe, string args, int timeoutMs)
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo(exe, args) {
+                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                    StandardOutputEncoding = Encoding.UTF8, WorkingDirectory = Home };
+                using (var proc = System.Diagnostics.Process.Start(psi))
+                {
+                    proc.ErrorDataReceived += (s, e) => { };
+                    proc.BeginErrorReadLine();
+                    var read = proc.StandardOutput.ReadToEndAsync();
+                    if (!proc.WaitForExit(timeoutMs)) { try { proc.Kill(); } catch (Exception) { } return null; }
+                    return read.Wait(5000) ? read.Result : null;
+                }
+            }
+            catch (Exception) { return null; }
+        }
+
+        // ---------- Gemini CLI ----------
+        // Открытый клиент OAuth самого Gemini CLI (он опубликован в его исходниках) — нужен, чтобы обновить истёкший вход.
+        const string GeminiClientId = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+        const string GeminiClientSecret = "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";
+        const string CodeAssist = "https://cloudcode-pa.googleapis.com/v1internal:";
+        static string geminiToken, geminiProject;
+        static DateTime geminiTokenUntil = DateTime.MinValue;
+
+        static string GeminiDir
+        {
+            get
+            {
+                string env = Environment.GetEnvironmentVariable("GEMINI_CLI_HOME");
+                return Path.Combine(string.IsNullOrEmpty(env) ? Home : env, ".gemini");
+            }
+        }
+
+        static ExtraResult Gemini()
+        {
+            var creds = File(Path.Combine(GeminiDir, "oauth_creds.json"));
+            if (creds == null) return new ExtraResult { SignedIn = false };
+            // вошли по API-ключу или через Vertex — лимитов подписки нет
+            string type = Str(Get(Obj(Obj(File(Path.Combine(GeminiDir, "settings.json")), "security"), "auth"), "selectedType"));
+            if (!string.IsNullOrEmpty(type) && type != "oauth-personal") return new ExtraResult { SignedIn = false };
+            string token = Str(Get(creds, "access_token")) ?? "";
+            double? expiryMs = Num(Get(creds, "expiry_date"));
+            DateTime expiry = expiryMs.HasValue ? DateTimeOffset.FromUnixTimeMilliseconds((long)expiryMs.Value).LocalDateTime : DateTime.MinValue;
+            if (expiry < DateTime.Now.AddSeconds(60))
+            {
+                if (geminiToken != null && geminiTokenUntil > DateTime.Now.AddSeconds(60)) token = geminiToken;
+                else
+                {
+                    string refresh = Str(Get(creds, "refresh_token"));
+                    if (string.IsNullOrEmpty(refresh)) return new ExtraResult { SignedIn = false };
+                    string form = "client_id=" + Uri.EscapeDataString(GeminiClientId) + "&client_secret=" + Uri.EscapeDataString(GeminiClientSecret)
+                                + "&refresh_token=" + Uri.EscapeDataString(refresh) + "&grant_type=refresh_token";
+                    string text;
+                    int code = Http("https://oauth2.googleapis.com/token", "POST",
+                                    new Dictionary<string, string> { { "Content-Type", "application/x-www-form-urlencoded" } }, form, out text);
+                    var d = Ok(code) ? Parse(text) : null;
+                    string t = Str(Get(d, "access_token"));
+                    if (string.IsNullOrEmpty(t))
+                    {
+                        if (code == 400 || code == 401) return new ExtraResult { Problem = "Вход Gemini CLI устарел — запустите gemini и войдите снова" };
+                        return Problem("Gemini CLI", code);
+                    }
+                    token = t;
+                    geminiToken = t;
+                    geminiTokenUntil = DateTime.Now.AddSeconds(Num(Get(d, "expires_in")) ?? 3000);
+                }
+            }
+            var headers = new Dictionary<string, string> {
+                { "Authorization", "Bearer " + token }, { "Content-Type", "application/json" }, { "User-Agent", "GeminiCLI AiLimitWidget/1.0" } };
+            var r = new ExtraResult();
+            r.Email = Str(Get(Claims(Str(Get(creds, "id_token"))), "email"));
+            // проект и тариф — как при запуске Gemini CLI
+            string lt;
+            int lc = Http(CodeAssist + "loadCodeAssist", "POST", headers,
+                          "{\"metadata\":{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}}", out lt);
+            var load = Ok(lc) ? Parse(lt) : null;
+            if (load == null) return Problem("Gemini CLI", lc);
+            var tier = Obj(load, "paidTier") ?? Obj(load, "currentTier");
+            r.Plan = (Str(Get(tier, "name")) ?? Str(Get(tier, "id")) ?? "").Replace("Gemini Code Assist ", "");
+            string project = Str(Get(load, "cloudaicompanionProject")) ?? Str(Get(Obj(load, "cloudaicompanionProject"), "id")) ?? geminiProject;
+            geminiProject = project;
+            var q = new Dictionary<string, object>();
+            if (project != null) q["project"] = project;
+            string qt;
+            int qc = Http(CodeAssist + "retrieveUserQuota", "POST", headers, new JavaScriptSerializer().Serialize(q), out qt);
+            var quota = Ok(qc) ? Parse(qt) : null;
+            if (quota == null) return Problem("Gemini CLI", qc);
+            // по модели — остаток запросов на сутки; показываем Pro и Flash, остальные модели делят те же лимиты
+            var byModel = new Dictionary<string, Limit>();
+            var buckets = Get(quota, "buckets") as System.Collections.IEnumerable;
+            if (buckets != null)
+                foreach (var b in buckets.OfType<Dictionary<string, object>>())
+                {
+                    string model = Str(Get(b, "modelId"));
+                    double? left = Num(Get(b, "remainingFraction"));
+                    if (model == null || !left.HasValue || model.Contains("lite") || model.Contains("embedding")) continue;
+                    double used = Clamp((1 - left.Value) * 100);
+                    string title = model.Contains("pro") ? "Сутки · Pro" : model.Contains("flash") ? "Сутки · Flash" : "Сутки · " + model;
+                    Limit old;
+                    if (byModel.TryGetValue(title, out old) && old.Percent >= used) continue;
+                    byModel[title] = new Limit { Key = "geminicli-" + title, Title = title, Percent = used, ResetsAt = Time(Get(b, "resetTime")), WindowSeconds = 86400 };
+                }
+            r.Limits.AddRange(byModel.Values.OrderByDescending(l => l.Percent));
+            if (r.Limits.Count == 0) r.Problem = "Сервер не сообщил лимиты";
+            return r;
+        }
+
+        // ---------- GitHub Copilot ----------
+        static IEnumerable<string> CopilotDirs
+        {
+            get
+            {
+                string xdg = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME");
+                string local = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+                yield return Path.Combine(Home, ".copilot");
+                yield return Path.Combine(string.IsNullOrEmpty(xdg) ? Path.Combine(Home, ".config") : xdg, "github-copilot");
+                if (!string.IsNullOrEmpty(local)) yield return Path.Combine(local, "github-copilot");
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct Credential
+        {
+            public int Flags, Type;
+            public string TargetName, Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public int CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public int Persist, AttributeCount;
+            public IntPtr Attributes;
+            public string TargetAlias, UserName;
+        }
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CredEnumerate(string filter, int flags, out int count, out IntPtr list);
+        [DllImport("advapi32.dll")] static extern void CredFree(IntPtr buffer);
+
+        // Copilot CLI хранит вход в диспетчере учётных данных Windows (как в связке ключей на Mac)
+        static string CredentialToken()
+        {
+            IntPtr list;
+            int count;
+            if (!CredEnumerate("*copilot*", 0, out count, out list)) return null;
+            try
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    var c = (Credential)Marshal.PtrToStructure(Marshal.ReadIntPtr(list, i * IntPtr.Size), typeof(Credential));
+                    if (c.CredentialBlob == IntPtr.Zero || c.CredentialBlobSize <= 0) continue;
+                    var bytes = new byte[c.CredentialBlobSize];
+                    Marshal.Copy(c.CredentialBlob, bytes, 0, bytes.Length);
+                    // строка бывает в UTF-8 или UTF-16 — пробуем обе
+                    foreach (var enc in new[] { Encoding.UTF8, Encoding.Unicode })
+                    {
+                        string s = enc.GetString(bytes).Trim().Trim('\0');
+                        string t = FirstToken(s) ?? FirstToken(Parse(s));
+                        if (t != null) return t;
+                    }
+                }
+            }
+            catch (Exception) { }
+            finally { CredFree(list); }
+            return null;
+        }
+
+        // вход: Copilot CLI (диспетчер учётных данных или его config.json), плагин Copilot (apps.json / hosts.json), затем gh
+        static string CopilotToken()
+        {
+            string t = CredentialToken();
+            if (t != null) return t;
+            foreach (string dir in CopilotDirs)
+                foreach (string f in new[] { "config.json", "apps.json", "hosts.json" })
+                {
+                    t = FirstToken(File(Path.Combine(dir, f)));
+                    if (t != null) return t;
+                }
+            string pf = Environment.GetEnvironmentVariable("ProgramFiles");
+            string installed = string.IsNullOrEmpty(pf) ? null : Path.Combine(pf, "GitHub CLI", "gh.exe");
+            string gh = installed != null && System.IO.File.Exists(installed) ? installed : "gh";
+            string out1 = (Run(gh, "auth token", 10000) ?? "").Trim();
+            return out1.StartsWith("gh", StringComparison.Ordinal) ? out1 : null;
+        }
+
+        // токены GitHub начинаются с gho_ / ghu_ / github_pat_ — ищем по всему файлу, где бы он ни лежал
+        static string FirstToken(object v)
+        {
+            var s = v as string;
+            if (s != null) return s.StartsWith("gho_", StringComparison.Ordinal) || s.StartsWith("ghu_", StringComparison.Ordinal)
+                                  || s.StartsWith("github_pat_", StringComparison.Ordinal) ? s : null;
+            var d = v as Dictionary<string, object>;
+            if (d != null)
+            {
+                foreach (string key in new[] { "oauth_token", "token", "copilot_tokens" })
+                {
+                    string t = FirstToken(Get(d, key));
+                    if (t != null) return t;
+                }
+                foreach (var x in d.Values)
+                {
+                    string t = FirstToken(x);
+                    if (t != null) return t;
+                }
+                return null;
+            }
+            var a = v as System.Collections.IEnumerable;
+            if (a != null)
+                foreach (var x in a)
+                {
+                    string t = FirstToken(x);
+                    if (t != null) return t;
+                }
+            return null;
+        }
+
+        static ExtraResult Copilot()
+        {
+            bool hasApp = CopilotDirs.Any(Directory.Exists);
+            string token = hasApp ? CopilotToken() : null;
+            if (token == null) return new ExtraResult { SignedIn = false };
+            string text;
+            int code = Http("https://api.github.com/copilot_internal/user", "GET", new Dictionary<string, string> {
+                { "Authorization", "token " + token }, { "Accept", "application/json" },
+                { "Editor-Version", "vscode/1.99.0" }, { "Editor-Plugin-Version", "copilot-chat/0.26.0" },
+                { "User-Agent", "GitHubCopilotChat/0.26.0" }, { "X-Github-Api-Version", "2025-04-01" } }, null, out text);
+            if (code == 404) return new ExtraResult { SignedIn = false };   // у аккаунта нет Copilot
+            var d = Ok(code) ? Parse(text) : null;
+            if (d == null) return Problem("Copilot", code);
+            var r = new ExtraResult();
+            r.Plan = Capital((Str(Get(d, "copilot_plan")) ?? Str(Get(d, "access_type_sku")) ?? "").Replace("_", " "));
+            r.Email = Str(Get(d, "login"));
+            DateTime? resetAt = Time(Get(d, "quota_reset_date_utc")) ?? Day(Str(Get(d, "quota_reset_date")) ?? Str(Get(d, "limited_user_reset_date")));
+            const long month = 30 * 86400;
+            var names = new Dictionary<string, string> { { "premium_interactions", "Премиум-запросы · месяц" }, { "chat", "Чат · месяц" }, { "completions", "Дополнения · месяц" } };
+            var snaps = Obj(d, "quota_snapshots");
+            var leftQuotas = Obj(d, "limited_user_quotas");
+            var totalQuotas = Obj(d, "monthly_quotas");
+            if (snaps != null)
+            {
+                foreach (string key in new[] { "premium_interactions", "chat", "completions" })
+                {
+                    var s = Obj(snaps, key);
+                    if (s == null || Bool(Get(s, "unlimited")) == true) continue;
+                    double? left = Num(Get(s, "percent_remaining"));
+                    if (!left.HasValue)
+                    {
+                        double? e = Num(Get(s, "entitlement")), rem = Num(Get(s, "remaining"));
+                        if (e.HasValue && e.Value > 0 && rem.HasValue) left = rem.Value / e.Value * 100;
+                    }
+                    if (!left.HasValue) continue;
+                    r.Limits.Add(new Limit { Key = "copilot-" + key, Title = names[key], Percent = Clamp(100 - left.Value), ResetsAt = resetAt, WindowSeconds = month });
+                }
+            }
+            else if (leftQuotas != null && totalQuotas != null)
+            {
+                // бесплатный Copilot: сколько осталось из месячной нормы
+                foreach (string key in new[] { "chat", "completions" })
+                {
+                    double? t = Num(Get(totalQuotas, key)), rem = Num(Get(leftQuotas, key));
+                    if (!t.HasValue || t.Value <= 0 || !rem.HasValue) continue;
+                    r.Limits.Add(new Limit { Key = "copilot-" + key, Title = names[key], Percent = Clamp((t.Value - rem.Value) / t.Value * 100), ResetsAt = resetAt, WindowSeconds = month });
+                }
+            }
+            if (r.Limits.Count == 0) r.Problem = "Без ограничений по тарифу";
+            return r;
+        }
+
+        // ---------- Cursor ----------
+        // В Windows нет sqlite3, поэтому значения из базы Cursor (SQLite) достаём сами: ищем запись «ключ → значение»
+        // в файле базы и в её журнале (-wal, там самые свежие страницы). Токен читаем заново, только когда он
+        // истекает, сервер его не принял или база менялась больше 10 минут назад — файл бывает большим.
+        static string CursorDb
+        {
+            get
+            {
+                string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                return Path.Combine(appData, "Cursor", "User", "globalStorage", "state.vscdb");
+            }
+        }
+
+        static string cursorToken, cursorEmail;
+        static DateTime cursorStamp = DateTime.MinValue, cursorReadAt = DateTime.MinValue, cursorTokenUntil = DateTime.MinValue;
+
+        static void ReadCursor(bool force)
+        {
+            string db = CursorDb, wal = db + "-wal";
+            DateTime stamp = System.IO.File.GetLastWriteTimeUtc(db);
+            if (System.IO.File.Exists(wal)) { DateTime w = System.IO.File.GetLastWriteTimeUtc(wal); if (w > stamp) stamp = w; }
+            bool fresh = cursorToken != null && cursorTokenUntil > DateTime.Now.AddMinutes(1)
+                         && (stamp == cursorStamp || DateTime.Now - cursorReadAt < TimeSpan.FromMinutes(10));
+            if (fresh && !force) return;
+            string token = null, email = null;
+            double bestExp = double.MinValue;
+            foreach (string path in new[] { db, wal })
+            {
+                byte[] data = ReadShared(path);
+                if (data == null) continue;
+                foreach (string t in SqliteValues(data, "cursorAuth/accessToken"))
+                {
+                    if (!t.StartsWith("eyJ", StringComparison.Ordinal)) continue;
+                    // старые копии записи могут остаться в свободных страницах — берём токен с самым поздним сроком
+                    double exp = Num(Get(Claims(t), "exp")) ?? 0;
+                    if (exp >= bestExp) { bestExp = exp; token = t; }
+                }
+                foreach (string e in SqliteValues(data, "cursorAuth/cachedEmail"))
+                    if (e.Contains("@")) email = e;
+            }
+            cursorToken = token;
+            cursorEmail = email;
+            cursorStamp = stamp;
+            cursorReadAt = DateTime.Now;
+            cursorTokenUntil = token != null && bestExp > 0 ? DateTimeOffset.FromUnixTimeSeconds((long)bestExp).LocalDateTime : DateTime.Now.AddHours(1);
+        }
+
+        static byte[] ReadShared(string path)
+        {
+            try
+            {
+                if (!System.IO.File.Exists(path)) return null;
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    var data = new byte[fs.Length];
+                    int read = 0, n;
+                    while (read < data.Length && (n = fs.Read(data, read, data.Length - read)) > 0) read += n;
+                    return data;
+                }
+            }
+            catch (Exception) { return null; }
+        }
+
+        // запись таблицы ItemTable(key, value) в SQLite: [размер заголовка][тип key][тип value][key][value];
+        // тип текста — 2·N+13, двоичных данных — 2·N+12 (N — длина в байтах), числа — varint
+        static IEnumerable<string> SqliteValues(byte[] data, string key)
+        {
+            byte[] k = Encoding.UTF8.GetBytes(key);
+            long keyType = 2L * k.Length + 13;
+            for (int p = IndexOf(data, k, 0); p >= 0; p = IndexOf(data, k, p + 1))
+            {
+                // заголовок стоит прямо перед ключом: пробуем все длины поля типа value (1–4 байта)
+                for (int h = 3; h <= 6; h++)
+                {
+                    int start = p - h;
+                    if (start < 0 || data[start] != h) continue;
+                    int pos = start + 1;
+                    long t1 = Varint(data, ref pos);
+                    if (t1 != keyType) continue;
+                    long t2 = Varint(data, ref pos);
+                    if (pos != p || t2 < 12) continue;
+                    long len = (t2 - 12) / 2;
+                    int from = p + k.Length;
+                    if (len <= 0 || from + len > data.Length) continue;
+                    yield return Encoding.UTF8.GetString(data, from, (int)len);
+                    break;
+                }
+            }
+        }
+
+        static long Varint(byte[] data, ref int pos)
+        {
+            long v = 0;
+            for (int i = 0; i < 9 && pos < data.Length; i++)
+            {
+                byte b = data[pos++];
+                if (i == 8) return (v << 8) | b;
+                v = (v << 7) | (long)(b & 0x7F);
+                if ((b & 0x80) == 0) return v;
+            }
+            return -1;
+        }
+
+        static int IndexOf(byte[] data, byte[] k, int from)
+        {
+            for (int i = from; i <= data.Length - k.Length; i++)
+            {
+                if (data[i] != k[0]) continue;
+                int j = 1;
+                while (j < k.Length && data[i + j] == k[j]) j++;
+                if (j == k.Length) return i;
+            }
+            return -1;
+        }
+
+        static ExtraResult Cursor() { return Cursor(false); }
+
+        static ExtraResult Cursor(bool retried)
+        {
+            if (!System.IO.File.Exists(CursorDb)) return new ExtraResult { SignedIn = false };
+            ReadCursor(retried);
+            string token = cursorToken;
+            if (token == null) return new ExtraResult { SignedIn = false };
+            // сайт Cursor узнаёт пользователя по cookie «id::токен»; id — в самом токене (sub = «auth0|user_…»)
+            string sub = Str(Get(Claims(token), "sub")) ?? "";
+            string user = sub.Split('|').Last();
+            string text;
+            int code = Http("https://cursor.com/api/usage-summary", "GET", new Dictionary<string, string> {
+                { "Cookie", "WorkosCursorSessionToken=" + user + "%3A%3A" + token }, { "Accept", "application/json" },
+                { "Origin", "https://cursor.com" }, { "User-Agent", "Mozilla/5.0 AiLimitWidget/1.0" } }, null, out text);
+            // токен в памяти устарел (Cursor уже обновил его в базе) — перечитываем базу один раз
+            if ((code == 401 || code == 403) && !retried) return Cursor(true);
+            var d = Ok(code) ? Parse(text) : null;
+            if (d == null) return Problem("Cursor", code);
+            var r = new ExtraResult();
+            r.Email = cursorEmail;
+            r.Plan = Capital(Str(Get(d, "membershipType")) ?? "");
+            DateTime? end = Time(Get(d, "billingCycleEnd")), start = Time(Get(d, "billingCycleStart"));
+            long secs = (long)Math.Max(86400, end.HasValue ? (end.Value - (start ?? DateTime.Now)).TotalSeconds : 30 * 86400);
+            var individual = Obj(d, "individualUsage");
+            var plan = Obj(individual, "plan");
+            if (plan != null)
+            {
+                double? pct = Num(Get(plan, "totalPercentUsed"));
+                if (!pct.HasValue)
+                {
+                    double? used = Num(Get(plan, "used")), limit = Num(Get(plan, "limit"));
+                    if (used.HasValue && limit.HasValue && limit.Value > 0) pct = used.Value / limit.Value * 100;
+                }
+                if (pct.HasValue) r.Limits.Add(new Limit { Key = "cursor-plan", Title = "Тариф · месяц", Percent = Clamp(pct.Value), ResetsAt = end, WindowSeconds = secs });
+            }
+            var od = Obj(individual, "onDemand");
+            if (od != null && Bool(Get(od, "enabled")) == true)
+            {
+                double? used = Num(Get(od, "used")), limit = Num(Get(od, "limit"));
+                if (used.HasValue && limit.HasValue && limit.Value > 0)
+                    r.Limits.Add(new Limit { Key = "cursor-ondemand", Title = "Сверх тарифа · месяц", Percent = Clamp(used.Value / limit.Value * 100), ResetsAt = end, WindowSeconds = secs });
+            }
+            if (r.Limits.Count == 0) r.Problem = "Сервер не сообщил лимиты";
+            return r;
+        }
+    }
+
     sealed class Widget
     {
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
@@ -197,12 +812,15 @@ namespace AiLimitWidget
                 case "claude": return Accent;
                 case "gemini": return GeminiColor;
                 case "codex": return CodexColor;
-                default: return AgyClaudeColor;   // 3p — Claude и GPT в Antigravity
+                default:
+                    var extra = Extra.All.FirstOrDefault(x => x[0] == key);
+                    return extra != null ? C(extra[2]) : AgyClaudeColor;   // 3p — Claude и GPT в Antigravity
             }
         }
 
         // столбцы надписи у часов, слева направо
-        static readonly string[][] ClockColumns = { new[] { "claude", "Claude Code" }, new[] { "gemini", "Gemini" }, new[] { "3p", "Claude и GPT (Antigravity)" }, new[] { "codex", "Codex" } };
+        static readonly string[][] ClockColumns = new[] { new[] { "claude", "Claude Code" }, new[] { "gemini", "Gemini" }, new[] { "3p", "Claude и GPT (Antigravity)" }, new[] { "codex", "Codex" } }
+            .Concat(Extra.All.Select(x => new[] { x[0], x[1] })).ToArray();
 
         bool ClockShows(string key) { return settings.ClockItems.Split(',').Contains(key); }
 
@@ -421,6 +1039,13 @@ namespace AiLimitWidget
                     limits[0, p] = CodexShort;
                     limits[1, p] = CodexLong;
                 }
+                else if (ExtraFor(key) != null)
+                {
+                    ExtraProvider x = ExtraFor(key);
+                    shown[p] = x.SignedIn && ExtraOn(key) && x.Limits.Count > 0;
+                    limits[0, p] = x.Short;
+                    limits[1, p] = x.Long;
+                }
                 else
                 {
                     AgyGroup g = agyGroups.FirstOrDefault(x => x.Key == key);
@@ -442,7 +1067,8 @@ namespace AiLimitWidget
                     if (clockCells[i, p].Visibility != vis) clockCells[i, p].Visibility = vis;
                     Limit l = limits[i, p];
                     double v = Current(l, now);
-                    string text = l != null ? Math.Round(v) + "%" : "—";
+                    // у другого ИИ один лимит (например, месяц у Copilot) — нижняя строка пустая
+                    string text = l != null ? Math.Round(v) + "%" : i == 1 && ExtraFor(ClockColumns[p][0]) != null ? "" : "—";
                     if (clockValues[i, p].Text != text) clockValues[i, p].Text = text;
                     SetInk(clockValues[i, p], v >= 75 ? Severity(v) : C(light ? "#1C1C1E" : "#FFFFFF"));
                 }
@@ -559,6 +1185,7 @@ namespace AiLimitWidget
                 if ((v = Get(d, "LoggedOut")) != null) settings.LoggedOut = Convert.ToString(v, Inv);
                 if (Get(d, "ShowDetails") is bool) settings.ShowDetails = (bool)Get(d, "ShowDetails");
                 if ((v = Get(d, "ClockItems")) != null) settings.ClockItems = Convert.ToString(v, Inv);
+                if ((v = Get(d, "HiddenExtras")) != null) settings.HiddenExtras = Convert.ToString(v, Inv);
             }
             catch (Exception) { }
             if (!Positions.Contains(settings.Position)) settings.Position = "TR";
@@ -571,6 +1198,12 @@ namespace AiLimitWidget
                 if (!ClockShows("codex")) settings.ClockItems += ",codex";
                 settings.ClockVersion = 2;
             }
+            // столбцы других ИИ у часов появились ещё позже — тоже включаем один раз (видны, только когда есть вход)
+            if (settings.ClockVersion < 3)
+            {
+                foreach (var x in Extra.All) if (!ClockShows(x[0])) settings.ClockItems += "," + x[0];
+                settings.ClockVersion = 3;
+            }
         }
 
         void SaveSettings()
@@ -581,7 +1214,8 @@ namespace AiLimitWidget
                     { "Position", settings.Position }, { "Transparency", settings.Transparency }, { "RefreshMinutes", settings.RefreshMinutes },
                     { "Left", settings.Left }, { "Top", settings.Top }, { "KeepOpen", settings.KeepOpen }, { "Notify", settings.Notify }, { "ClockLabel", settings.ClockLabel },
                     { "ShowClaude", settings.ShowClaude }, { "ShowAgy", settings.ShowAgy }, { "ShowCodex", settings.ShowCodex },
-                    { "ClockItems", settings.ClockItems }, { "ClockVersion", settings.ClockVersion }, { "LoggedOut", settings.LoggedOut }, { "ShowDetails", settings.ShowDetails } };
+                    { "ClockItems", settings.ClockItems }, { "ClockVersion", settings.ClockVersion }, { "LoggedOut", settings.LoggedOut }, { "ShowDetails", settings.ShowDetails },
+                    { "HiddenExtras", settings.HiddenExtras } };
                 File.WriteAllText(settingsPath, json.Serialize(d), new UTF8Encoding(false));
             }
             catch (Exception) { }
@@ -651,6 +1285,7 @@ namespace AiLimitWidget
             Fetch();
             FetchAgy();
             FetchCodex();
+            foreach (var x in extras) FetchExtra(x);
             CheckReturn(true);   // заодно — не вошли ли снова в скрытые после выхода сервисы
         }
 
@@ -1125,6 +1760,62 @@ namespace AiLimitWidget
         Limit CodexShort { get { return codexLimits.FirstOrDefault(l => l.WindowSeconds <= 24 * 3600); } }
         Limit CodexLong { get { return codexLimits.LastOrDefault(l => l.WindowSeconds > 24 * 3600); } }
 
+        // ---------- данные других ИИ ----------
+        // Вход не нашли — раздел не показываем и проверяем раз в несколько минут: вдруг войдут.
+        readonly List<ExtraProvider> extras = Extra.All.Select(x => new ExtraProvider { Key = x[0], Name = x[1], Color = C(x[2]) }).ToList();
+
+        ExtraProvider ExtraFor(string key) { return extras.FirstOrDefault(x => x.Key == key); }
+        bool ExtraOn(string key) { return !settings.HiddenExtras.Split(',').Contains(key); }
+        List<ExtraProvider> ShownExtras { get { return extras.Where(x => x.SignedIn && ExtraOn(x.Key)).ToList(); } }
+
+        void FetchExtra(ExtraProvider x)
+        {
+            if (x.Fetching || !ExtraOn(x.Key)) return;
+            x.Fetching = true;
+            x.NextFetch = DateTime.Now.AddMinutes(settings.RefreshMinutes);
+            UpdateSpin();
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                ExtraResult r;
+                try { r = Extra.Fetch(x.Key); }
+                catch (Exception) { r = new ExtraResult { Problem = "Нет соединения — повторю позже" }; }
+                dispatcher.BeginInvoke(new Action(() => FetchExtraDone(x, r)));
+            });
+        }
+
+        void FetchExtraDone(ExtraProvider x, ExtraResult r)
+        {
+            x.Fetching = false;
+            bool wasShown = x.SignedIn;
+            x.SignedIn = r.SignedIn;
+            if (!r.SignedIn)
+            {
+                x.Limits.Clear();
+                x.Plan = "";
+                x.Email = null;
+                x.UpdatedAt = null;
+                x.NextFetch = DateTime.Now.AddMinutes(Math.Max(settings.RefreshMinutes, 5));
+            }
+            else
+            {
+                if (!string.IsNullOrEmpty(r.Plan)) x.Plan = r.Plan;
+                if (!string.IsNullOrEmpty(r.Email)) x.Email = r.Email;
+                if (r.Problem == null || r.Limits.Count > 0)
+                {
+                    x.Limits.Clear();
+                    x.Limits.AddRange(r.Limits);
+                    x.UpdatedAt = DateTime.Now;
+                }
+                x.Status = r.Problem ?? "";
+                x.StatusIsError = r.Problem != null && x.UpdatedAt == null;
+                if (r.RetryAfterSeconds > 0) x.NextFetch = DateTime.Now.AddSeconds(r.RetryAfterSeconds);
+                CheckNotifications();
+            }
+            if (wasShown != x.SignedIn) lastTrayKey = null;
+            UpdateSpin();
+            UpdateView();
+        }
+
         // уведомление, когда лимит переходит 80% и 95% (один раз на окно лимита)
         void CheckNotifications()
         {
@@ -1143,6 +1834,8 @@ namespace AiLimitWidget
                 }
             if (settings.ShowCodex)
                 foreach (var l in codexLimits) all.Add(new KeyValuePair<string, Limit>("Codex", l));
+            foreach (var x in ShownExtras)
+                foreach (var l in x.Limits) all.Add(new KeyValuePair<string, Limit>(x.Name, l));
             foreach (var pair in all)
                 foreach (int t in NotifyThresholds.Reverse())
                 {
@@ -1343,6 +2036,12 @@ namespace AiLimitWidget
             bool codexExpired = codexLimits.Any(l => l.ResetsAt.HasValue && l.ResetsAt.Value <= DateTime.Now && l.Percent > 0);
             if (!codexFetching && (DateTime.Now >= codexNextFetch || (codexExpired && DateTime.Now >= codexNextFetch.AddMinutes(-settings.RefreshMinutes).AddSeconds(20))))
                 FetchCodex();
+            foreach (var x in extras.Where(e => !e.Fetching))
+            {
+                bool extraExpired = x.Limits.Any(l => l.ResetsAt.HasValue && l.ResetsAt.Value <= DateTime.Now && l.Percent > 0);
+                if (DateTime.Now >= x.NextFetch || (extraExpired && DateTime.Now >= x.NextFetch.AddMinutes(-settings.RefreshMinutes).AddSeconds(20)))
+                    FetchExtra(x);
+            }
             CheckReturn(false);
             UpdateView();
         }
@@ -1356,7 +2055,10 @@ namespace AiLimitWidget
         }
 
 
-        void UpdateSpin() { SetSpin(fetching || agyFetching || codexFetching); }
+        // фоновая проверка «не вошли ли» в скрытый другой ИИ кнопку не крутит
+        bool AnyFetching { get { return fetching || agyFetching || codexFetching || extras.Any(x => x.Fetching && x.SignedIn); } }
+
+        void UpdateSpin() { SetSpin(AnyFetching); }
 
         void SetSpin(bool on)
         {
@@ -1419,12 +2121,21 @@ namespace AiLimitWidget
                     foreach (var l in codexLimits) rows.Children.Add(Row(l, now, null, CodexColor));
                     if (!string.IsNullOrEmpty(codexStatus)) rows.Children.Add(StatusLine(codexStatus, codexStatusIsError));
                 }
+                // другие ИИ — только те, в которые вошли; у каждого свой цвет
+                foreach (var x in ShownExtras)
+                {
+                    rows.Children.Add(ProviderHeader(x.Name, new[] { x.Color }, x.Plan, rows.Children.Count == 0));
+                    if (x.Limits.Count == 0 && string.IsNullOrEmpty(x.Status)) rows.Children.Add(Hint("Загрузка…"));
+                    foreach (var l in x.Limits) rows.Children.Add(Row(l, now, null, x.Color));
+                    if (!string.IsNullOrEmpty(x.Status)) rows.Children.Add(StatusLine(x.Status, x.StatusIsError));
+                }
             }
 
             // подпись: когда обновлялось (по самому свежему из сервисов)
             string sub;
             DateTime? last = Max(Max(settings.ShowClaude ? updatedAt : null, settings.ShowAgy ? agyUpdatedAt : null), settings.ShowCodex ? codexUpdatedAt : null);
-            if (fetching || agyFetching || codexFetching) sub = "обновление…";
+            foreach (var x in ShownExtras) last = Max(last, x.UpdatedAt);
+            if (AnyFetching) sub = "обновление…";
             else if (last.HasValue) sub = "обновлено " + last.Value.ToString(last.Value.Date == now.Date ? "HH:mm" : "d MMM HH:mm", Ru);
             else sub = "";
             Find<TextBlock>("SubText").Text = sub;
@@ -1665,6 +2376,7 @@ namespace AiLimitWidget
             if (claudeOn) accounts.Add(Tuple.Create(Accent, "Claude Code", Acc("emailAddress"), plan.Length > 0 ? "Claude " + plan : null));
             if (agyOn) accounts.Add(Tuple.Create(GeminiColor, "Antigravity", agyEmail, (string)null));
             if (codexOn) accounts.Add(Tuple.Create(CodexColor, "Codex", codexEmail, codexPlan.Length > 0 ? "ChatGPT " + codexPlan : null));
+            foreach (var x in ShownExtras) accounts.Add(Tuple.Create(x.Color, x.Name, x.Email, x.Plan.Length > 0 ? x.Plan : null));
             var emails = accounts.Select(a => a.Item3).Where(e => !string.IsNullOrEmpty(e)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             bool oneEmail = emails.Count == 1;
             Section(panel, "Аккаунты");
@@ -1683,6 +2395,11 @@ namespace AiLimitWidget
             if (agyOn)
                 foreach (var g in agyGroups.Where(g => g.Week != null)) week.Add(Tuple.Create(GroupColor(g.Key), g.Title + " · лимит", Current(g.Week, now)));
             if (codexOn && CodexLong != null) week.Add(Tuple.Create(CodexColor, "Codex · " + CodexLong.Title.ToLower(Ru), Current(CodexLong, now)));
+            foreach (var x in ShownExtras)
+            {
+                Limit l = x.Long ?? x.Short;
+                if (l != null) week.Add(Tuple.Create(x.Color, x.Name + " · " + l.Title.ToLower(Ru), Current(l, now)));
+            }
             if (week.Count > 0)
             {
                 Section(panel, "На что ушла неделя");
@@ -1695,10 +2412,11 @@ namespace AiLimitWidget
             if (claudeOn) { last = Max(last, updatedAt); if (!fetching) next.Add(nextFetch); }
             if (agyOn) { last = Max(last, agyUpdatedAt); if (!agyFetching) next.Add(agyNextFetch); }
             if (codexOn) { last = Max(last, codexUpdatedAt); if (!codexFetching) next.Add(codexNextFetch); }
+            foreach (var x in ShownExtras) { last = Max(last, x.UpdatedAt); if (!x.Fetching) next.Add(x.NextFetch); }
             var soon = next.Where(t => t > now).DefaultIfEmpty(DateTime.MinValue).Min();
             Section(panel, "Данные");
             Pair(panel, "Обновлено", last.HasValue ? last.Value.ToString(last.Value.Date == now.Date ? "HH:mm:ss" : "d MMM HH:mm", Ru) : "ещё нет");
-            Pair(panel, "Следующее", fetching || agyFetching || codexFetching ? "обновляю…" : soon > now ? "через " + Duration(soon - now) : null);
+            Pair(panel, "Следующее", AnyFetching ? "обновляю…" : soon > now ? "через " + Duration(soon - now) : null);
         }
 
         // строка подробностей с цветной точкой сервиса перед названием
@@ -1776,7 +2494,7 @@ namespace AiLimitWidget
             int ticks = 0;
             wait.Tick += (s, e) =>
             {
-                if (++ticks < 25 && (fetching || agyFetching || codexFetching || ticks < 3)) return;
+                if (++ticks < 25 && (AnyFetching || ticks < 3)) return;
                 wait.Stop();
                 UpdateView();
                 window.UpdateLayout();
@@ -1886,6 +2604,7 @@ namespace AiLimitWidget
                 foreach (var gr in agyGroups)
                     tip.Add((gr.Key == "3p" ? "Claude/GPT" : gr.Title) + " " + Math.Round(Current(gr.Session, now)) + "%");
             if (settings.ShowCodex && codexLimits.Count > 0) tip.Add("Codex " + Math.Round(Current(codexLimits[0], now)) + "%");
+            foreach (var x in ShownExtras) if (x.Short != null) tip.Add(x.Name + " " + Math.Round(Current(x.Short, now)) + "%");
             string text63 = tip.Count == 0 ? "Лимиты ИИ" : string.Join(" · ", tip);
             tray.Text = text63.Length > 63 ? text63.Substring(0, 63) : text63;
 
@@ -2047,7 +2766,7 @@ namespace AiLimitWidget
             item.Click += (s, e) =>
             {
                 bool on = !item.IsChecked;
-                if (!on && (settings.ShowClaude ? 1 : 0) + (settings.ShowAgy ? 1 : 0) + (settings.ShowCodex ? 1 : 0) <= 1) return;
+                if (!on && ShownServices <= 1) return;
                 item.IsChecked = on;
                 set(on);
                 SaveSettings();
@@ -2114,10 +2833,19 @@ namespace AiLimitWidget
             menu.Items.Add(Item("Обновить", false, FetchAll));
             menu.Items.Add(new Separator());
             menu.Items.Add(Sub("Показывать",
-                ServiceToggle("Claude Code", settings.ShowClaude, v => { settings.ShowClaude = v; SetLoggedOut("claude", false); }, Fetch),
-                ServiceToggle("Antigravity", settings.ShowAgy, v => { settings.ShowAgy = v; SetLoggedOut("agy", false); }, FetchAgy),
-                ServiceToggle("Codex", settings.ShowCodex, v => { settings.ShowCodex = v; SetLoggedOut("codex", false); }, FetchCodex)));
-            menu.Items.Add(Sub("У часов", ClockColumns.Select(c => ClockToggle(c[0], c[1])).ToArray()));
+                new[] {
+                    ServiceToggle("Claude Code", settings.ShowClaude, v => { settings.ShowClaude = v; SetLoggedOut("claude", false); }, Fetch),
+                    ServiceToggle("Antigravity", settings.ShowAgy, v => { settings.ShowAgy = v; SetLoggedOut("agy", false); }, FetchAgy),
+                    ServiceToggle("Codex", settings.ShowCodex, v => { settings.ShowCodex = v; SetLoggedOut("codex", false); }, FetchCodex) }
+                .Concat(extras.Where(x => x.SignedIn).Select(x => ServiceToggle(x.Name, ExtraOn(x.Key), v =>
+                {
+                    var list = settings.HiddenExtras.Split(',').Where(k => k.Length > 0 && k != x.Key).ToList();
+                    if (!v) list.Add(x.Key);
+                    settings.HiddenExtras = string.Join(",", list);
+                }, () => FetchExtra(x)))).ToArray()));
+            // столбцы других ИИ — только тех, в которые вошли
+            menu.Items.Add(Sub("У часов", ClockColumns.Where(c => { var x = ExtraFor(c[0]); return x == null || x.SignedIn; })
+                                                      .Select(c => ClockToggle(c[0], c[1])).ToArray()));
             menu.Items.Add(Toggle("Не скрывать при нажатии мимо", settings.KeepOpen, () => { settings.KeepOpen = !settings.KeepOpen; SaveSettings(); }));
             menu.Items.Add(Toggle("Показывать у часов", settings.ClockLabel, () =>
             {
@@ -2240,7 +2968,7 @@ namespace AiLimitWidget
             }
         }
 
-        int ShownServices { get { return (settings.ShowClaude ? 1 : 0) + (settings.ShowAgy ? 1 : 0) + (settings.ShowCodex ? 1 : 0); } }
+        int ShownServices { get { return (settings.ShowClaude ? 1 : 0) + (settings.ShowAgy ? 1 : 0) + (settings.ShowCodex ? 1 : 0) + ShownExtras.Count; } }
 
         // подтверждение показываем в самом окне (отдельное окно-вопрос пряталось за другими окнами);
         // из какого сервиса выходить, выбирают в меню «Выйти из аккаунта»

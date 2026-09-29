@@ -1421,15 +1421,21 @@ namespace AiLimitWidget
             catch (Exception) { return null; }
         }
 
-        // «agy update» в фоне, без окна: при запуске виджета и дальше раз в 6 часов
-        static DateTime agyUpdatedCheck = DateTime.MinValue;
+        // «agy update» в фоне, без окна и отдельно от опроса: лимиты не ждут обновления.
+        // Проверяем с тем же интервалом, что и лимиты; пока одно обновление идёт, второе не запускаем.
+        static DateTime agyUpdateCheck = DateTime.MinValue;
+        static int agyUpdating;
 
-        static void UpdateAgy()
+        static void UpdateAgy(int minutes)
         {
-            if (DateTime.Now < agyUpdatedCheck.AddHours(6)) return;
-            agyUpdatedCheck = DateTime.Now;
-            try { Background.Run(AgyExe, "update", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 600000); }
-            catch (Exception) { }
+            if (DateTime.Now < agyUpdateCheck.AddMinutes(minutes) || Interlocked.CompareExchange(ref agyUpdating, 1, 0) != 0) return;
+            agyUpdateCheck = DateTime.Now;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try { Background.Run(AgyExe, "update", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 600000); }
+                catch (Exception) { }
+                finally { agyUpdating = 0; }
+            });
         }
 
         // probe — пробный запрос для скрытого после выхода Antigravity: ответил — значит, снова вошли
@@ -1440,10 +1446,10 @@ namespace AiLimitWidget
             if (agyFetching || (!settings.ShowAgy && !probe)) return;
             agyFetching = true;
             agyNextFetch = DateTime.Now.AddMinutes(settings.RefreshMinutes);
+            UpdateAgy(settings.RefreshMinutes);
             SetSpin(true);
             ThreadPool.QueueUserWorkItem(_ =>
             {
-                UpdateAgy();
                 bool missing;
                 string quota = RunAgy("/quota", out missing);
                 bool ignored;

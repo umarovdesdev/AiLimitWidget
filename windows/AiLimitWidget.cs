@@ -353,20 +353,7 @@ namespace AiLimitWidget
         // выполнить программу без окна и дождаться вывода; null — не запустилась или не ответила
         static string Run(string exe, string args, int timeoutMs)
         {
-            try
-            {
-                var psi = new System.Diagnostics.ProcessStartInfo(exe, args) {
-                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
-                    StandardOutputEncoding = Encoding.UTF8, WorkingDirectory = Home };
-                using (var proc = System.Diagnostics.Process.Start(psi))
-                {
-                    proc.ErrorDataReceived += (s, e) => { };
-                    proc.BeginErrorReadLine();
-                    var read = proc.StandardOutput.ReadToEndAsync();
-                    if (!proc.WaitForExit(timeoutMs)) { try { proc.Kill(); } catch (Exception) { } return null; }
-                    return read.Wait(5000) ? read.Result : null;
-                }
-            }
+            try { return Background.Run(exe, args, Home, timeoutMs); }
             catch (Exception) { return null; }
         }
 
@@ -1426,20 +1413,23 @@ namespace AiLimitWidget
             missing = false;
             try
             {
-                var psi = new System.Diagnostics.ProcessStartInfo(AgyExe, "-p " + command + " --output-format json") {
-                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
-                    StandardOutputEncoding = Encoding.UTF8, WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) };
-                using (var proc = System.Diagnostics.Process.Start(psi))
-                {
-                    proc.ErrorDataReceived += (s, e) => { };
-                    proc.BeginErrorReadLine();
-                    var read = proc.StandardOutput.ReadToEndAsync();
-                    if (!proc.WaitForExit(45000)) { try { proc.Kill(); } catch (Exception) { } return null; }
-                    return read.Wait(5000) ? read.Result : null;
-                }
+                // своё автообновление agy запускает в новом окне консоли — при опросе выключаем его, обновляем сами (UpdateAgy)
+                return Background.Run(AgyExe, "-p " + command + " --output-format json", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 45000,
+                    new Dictionary<string, string> { { "AGY_CLI_DISABLE_AUTO_UPDATE", "true" } });
             }
             catch (System.ComponentModel.Win32Exception) { missing = true; return null; }
             catch (Exception) { return null; }
+        }
+
+        // «agy update» в фоне, без окна: при запуске виджета и дальше раз в 6 часов
+        static DateTime agyUpdatedCheck = DateTime.MinValue;
+
+        static void UpdateAgy()
+        {
+            if (DateTime.Now < agyUpdatedCheck.AddHours(6)) return;
+            agyUpdatedCheck = DateTime.Now;
+            try { Background.Run(AgyExe, "update", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 600000); }
+            catch (Exception) { }
         }
 
         // probe — пробный запрос для скрытого после выхода Antigravity: ответил — значит, снова вошли
@@ -1453,6 +1443,7 @@ namespace AiLimitWidget
             SetSpin(true);
             ThreadPool.QueueUserWorkItem(_ =>
             {
+                UpdateAgy();
                 bool missing;
                 string quota = RunAgy("/quota", out missing);
                 bool ignored;
@@ -2996,9 +2987,7 @@ namespace AiLimitWidget
                             UseShellExecute = true, WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) });
                     else
                     {
-                        var psi = new System.Diagnostics.ProcessStartInfo(target == "codex" ? CodexExe : ClaudeExe, target == "codex" ? "logout" : "auth logout") {
-                            UseShellExecute = false, CreateNoWindow = true };
-                        using (var proc = System.Diagnostics.Process.Start(psi)) proc.WaitForExit(30000);
+                        Background.Run(target == "codex" ? CodexExe : ClaudeExe, target == "codex" ? "logout" : "auth logout", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 30000);
                     }
                 }
                 catch (Exception) { }
@@ -3219,6 +3208,98 @@ namespace AiLimitWidget
                 ThreadPool.RegisterWaitForSingleObject(showEvent,
                     (state, timedOut) => app.Dispatcher.BeginInvoke(new Action(widget.ShowWidget)), null, -1, false);
                 app.Run();
+            }
+        }
+    }
+
+    // ---------- запуск CLI в фоне ----------
+    // agy, claude, gh при запуске сами проверяют обновления и ставят их — установщик открывает своё окно консоли
+    // (CreateNoWindow прячет только консоль самой программы, не её потомков). Поэтому запускаем их на отдельном
+    // невидимом рабочем столе: всё, что они или их потомки откроют, окажется там — обновление пройдёт в фоне.
+    static class Background
+    {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct STARTUPINFO
+        {
+            public int cb; public string lpReserved, lpDesktop, lpTitle;
+            public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+            public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool CreateProcess(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, int flags,
+            IntPtr env, string dir, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll")] static extern int WaitForSingleObject(IntPtr h, int ms);
+        [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr h, int code);
+        [DllImport("kernel32.dll")] static extern bool SetHandleInformation(IntPtr h, int mask, int flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, int share, IntPtr sa, int disposition, int flags, IntPtr template);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateDesktop(string name, IntPtr device, IntPtr devmode, int flags, uint access, IntPtr sa);
+
+        const string DesktopName = "AiLimitWidgetBackground";
+        static IntPtr desktop;   // держим открытым, пока жив виджет, иначе Windows удалит стол
+        static readonly object gate = new object();
+
+        static string Desktop()
+        {
+            lock (gate)
+            {
+                if (desktop == IntPtr.Zero) desktop = CreateDesktop(DesktopName, IntPtr.Zero, IntPtr.Zero, 0, 0x10000000 /* GENERIC_ALL */, IntPtr.Zero);
+                return desktop == IntPtr.Zero ? null : DesktopName;   // не вышло — запустим на обычном столе, но всё равно без окна
+            }
+        }
+
+        static string Quote(string s) { return s.IndexOf(' ') >= 0 && !s.StartsWith("\"") ? "\"" + s + "\"" : s; }
+
+        // запустить и дождаться; вывод — stdout программы (null — не ответила за timeoutMs);
+        // env — добавить переменные окружения; Win32Exception — программа не найдена
+        public static string Run(string exe, string args, string dir, int timeoutMs, IDictionary<string, string> env = null)
+        {
+            IntPtr block = IntPtr.Zero;
+            int flags = 0x08000000;   // CREATE_NO_WINDOW
+            if (env != null)
+            {
+                var all = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables()) all[(string)e.Key] = (string)e.Value;
+                foreach (var e in env) all[e.Key] = e.Value;
+                var sb = new StringBuilder();
+                foreach (var e in all) sb.Append(e.Key).Append('=').Append(e.Value).Append('\0');
+                block = Marshal.StringToHGlobalUni(sb.Append('\0').ToString());
+                flags |= 0x400;   // CREATE_UNICODE_ENVIRONMENT
+            }
+            try { return Run(exe, args, dir, timeoutMs, block, flags); }
+            finally { if (block != IntPtr.Zero) Marshal.FreeHGlobal(block); }
+        }
+
+        static string Run(string exe, string args, string dir, int timeoutMs, IntPtr env, int flags)
+        {
+            // stdin и stderr — в NUL (как у скрытой консоли), stdout — в канал, откуда читаем ответ
+            using (var nul = CreateFile("NUL", 0xC0000000 /* GENERIC_READ | GENERIC_WRITE */, 3, IntPtr.Zero, 3 /* OPEN_EXISTING */, 0, IntPtr.Zero))
+            using (var pipe = new System.IO.Pipes.AnonymousPipeServerStream(System.IO.Pipes.PipeDirection.In, HandleInheritability.Inheritable))
+            {
+                IntPtr nulHandle = nul.DangerousGetHandle();
+                SetHandleInformation(nulHandle, 1, 1);   // HANDLE_FLAG_INHERIT
+                var si = new STARTUPINFO {
+                    lpDesktop = Desktop(), dwFlags = 0x101 /* STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES */, wShowWindow = 0 /* SW_HIDE */,
+                    hStdInput = nulHandle, hStdOutput = pipe.ClientSafePipeHandle.DangerousGetHandle(), hStdError = nulHandle };
+                si.cb = Marshal.SizeOf(si);
+                PROCESS_INFORMATION pi;
+                var cmd = new StringBuilder(Quote(exe) + " " + args);
+                if (!CreateProcess(null, cmd, IntPtr.Zero, IntPtr.Zero, true, flags, env, dir, ref si, out pi))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                CloseHandle(pi.hThread);
+                pipe.DisposeLocalCopyOfClientHandle();
+                try
+                {
+                    var read = new StreamReader(pipe, Encoding.UTF8).ReadToEndAsync();
+                    if (WaitForSingleObject(pi.hProcess, timeoutMs) != 0) { TerminateProcess(pi.hProcess, 1); return null; }
+                    return read.Wait(5000) ? read.Result : null;
+                }
+                finally { CloseHandle(pi.hProcess); }
             }
         }
     }

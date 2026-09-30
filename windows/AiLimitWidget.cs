@@ -55,6 +55,10 @@ namespace AiLimitWidget
     {
         public string Key, Title, Models;
         public Limit Session, Week;
+        public bool SessionOff;   // 5-часовое окно отключено сервисом (упёрлись в недельный лимит)
+
+        // короткое окно для часов и значка: если 5 часов не действует — упираемся в неделю
+        public Limit Short { get { return Session ?? (SessionOff ? Week : null); } }
 
         // сколько реально доступно: упёрлись в любой из лимитов — группа стоит
         public double Used
@@ -1038,7 +1042,7 @@ namespace AiLimitWidget
                     AgyGroup g = agyGroups.FirstOrDefault(x => x.Key == key);
                     // пока данных нет — столбец всё равно показываем («—»), чтобы надпись не прыгала
                     shown[p] = settings.ShowAgy && !agyMissing && (g != null || agyGroups.Count == 0);
-                    limits[0, p] = g == null ? null : g.Session;
+                    limits[0, p] = g == null ? null : g.Short;
                     limits[1, p] = g == null ? null : g.Week;
                 }
                 shown[p] = shown[p] && ClockShows(key);
@@ -1527,8 +1531,13 @@ namespace AiLimitWidget
                         string id = Convert.ToString(Get(b, "id"), Inv) ?? "";
                         int dash = id.LastIndexOf('-');
                         if (g.Key == null && dash > 0) g.Key = id.Substring(0, dash);
-                        if (Get(b, "remaining_fraction") == null) continue;   // окно сейчас не действует («disabled»)
                         string window = Convert.ToString(Get(b, "window"), Inv);
+                        // окно сейчас не действует: «disabled» приходит вместе с remaining_fraction = 1, это не «0% израсходовано»
+                        if (Get(b, "remaining_fraction") == null || Convert.ToBoolean(Get(b, "disabled") ?? false, Inv))
+                        {
+                            if (window == "5h") g.SessionOff = true;
+                            continue;
+                        }
                         var l = new Limit { Key = id, Percent = Math.Max(0, Math.Min(100, (1 - Convert.ToDouble(Get(b, "remaining_fraction"), Inv)) * 100)),
                                             ResetsAt = ParseTime(Get(b, "reset_time")) };
                         if (window == "5h") { l.Title = "5 часов"; g.Session = l; }
@@ -2225,7 +2234,7 @@ namespace AiLimitWidget
             cols.ColumnDefinitions.Add(new ColumnDefinition());
             cols.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(14) });
             cols.ColumnDefinitions.Add(new ColumnDefinition());
-            var left = MiniBar("5 часов", g.Session, now, color);
+            var left = MiniBar("5 часов", g.Session, now, color, g.SessionOff ? "не действует — неделя исчерпана" : null);
             var right = MiniBar("Неделя", g.Week, now, color);
             Grid.SetColumn(right, 2);
             cols.Children.Add(left);
@@ -2240,7 +2249,7 @@ namespace AiLimitWidget
             return panel;
         }
 
-        static UIElement MiniBar(string label, Limit l, DateTime now, Color accent)
+        static UIElement MiniBar(string label, Limit l, DateTime now, Color accent, string offText = null)
         {
             var panel = new StackPanel();
             double pct = Current(l, now);
@@ -2255,13 +2264,13 @@ namespace AiLimitWidget
             head.Children.Add(value);
             panel.Children.Add(head);
             panel.Children.Add(Bar(pct, color, 5));
-            string text = l == null ? "не действует"
+            string text = l == null ? offText ?? "не действует"
                         : pct < 0.5 ? "не расходовался"
                         : l.ResetsAt.HasValue && l.ResetsAt.Value > now ? "сброс через " + Duration(l.ResetsAt.Value - now) : null;
             if (text != null)
                 panel.Children.Add(new TextBlock { Text = text, FontSize = 10.5, Foreground = B("#8E8E93"), Margin = new Thickness(0, 3, 0, 0),
                                                    TextTrimming = TextTrimming.CharacterEllipsis,
-                                                   ToolTip = l != null && l.ResetsAt.HasValue ? ResetMoment(l.ResetsAt.Value) : null });
+                                                   ToolTip = l != null && l.ResetsAt.HasValue ? ResetMoment(l.ResetsAt.Value) : l == null ? offText : null });
             return panel;
         }
 
@@ -2594,12 +2603,12 @@ namespace AiLimitWidget
             if (tray == null) return;
             DateTime now = DateTime.Now;
             AgyGroup ag = settings.ShowAgy ? ClockGroup() : null;
-            double agyPct = ag == null ? 0 : Current(ag.Session, now);
+            double agyPct = ag == null ? 0 : Current(ag.Short, now);
             var tip = new List<string>();
             if (settings.ShowClaude && session != null) tip.Add("Claude " + Math.Round(pct) + "%" + (weekly.Count > 0 ? " (нед. " + Math.Round(Current(weekly[0], now)) + "%)" : ""));
             if (settings.ShowAgy)
                 foreach (var gr in agyGroups)
-                    tip.Add((gr.Key == "3p" ? "Claude/GPT" : gr.Title) + " " + Math.Round(Current(gr.Session, now)) + "%");
+                    tip.Add((gr.Key == "3p" ? "Claude/GPT" : gr.Title) + " " + Math.Round(Current(gr.Short, now)) + "%");
             if (settings.ShowCodex && codexLimits.Count > 0) tip.Add("Codex " + Math.Round(Current(codexLimits[0], now)) + "%");
             foreach (var x in ShownExtras) if (x.Short != null) tip.Add(x.Name + " " + Math.Round(Current(x.Short, now)) + "%");
             string text63 = tip.Count == 0 ? "Лимиты ИИ" : string.Join(" · ", tip);
@@ -2607,9 +2616,9 @@ namespace AiLimitWidget
 
             // главное число — сессия Claude; если Claude скрыт — сессия Antigravity
             bool claudeMain = settings.ShowClaude;
-            bool known = claudeMain ? session != null : ag != null && ag.Session != null;
+            bool known = claudeMain ? session != null : ag != null && ag.Short != null;
             double main = claudeMain ? pct : agyPct;
-            bool stripe = claudeMain && ag != null && ag.Session != null;   // полоска снизу цвета группы — сессия Antigravity
+            bool stripe = claudeMain && ag != null && ag.Short != null;   // полоска снизу цвета группы — сессия Antigravity
             Color agyColor = ag == null ? GeminiColor : GroupColor(ag.Key);
             string key = (known ? Math.Round(main).ToString(Inv) : "-") + "|" + claudeMain + "|" + (stripe ? Math.Round(agyPct).ToString(Inv) + ag.Key : "");
             if (key == lastTrayKey) return;

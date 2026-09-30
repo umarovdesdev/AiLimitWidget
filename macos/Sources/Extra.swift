@@ -184,8 +184,8 @@ enum Extra {
     }
 
     static func copilot() -> ExtraResult {
-        let hasApp = copilotDirs.contains { FileManager.default.fileExists(atPath: $0) }
-        guard hasApp, let token = copilotToken() else { return ExtraResult(signedIn: false) }
+        // папок Copilot может не быть (VS Code хранит вход у себя) — тогда вход берём из gh
+        guard let token = copilotToken() else { return ExtraResult(signedIn: false) }
         let (code, text) = http("https://api.github.com/copilot_internal/user", headers: [
             "Authorization": "token " + token, "Accept": "application/json",
             "Editor-Version": "vscode/1.99.0", "Editor-Plugin-Version": "copilot-chat/0.26.0",

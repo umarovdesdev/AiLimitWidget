@@ -24,6 +24,10 @@ final class Limit {
 final class AgyGroup {
     var key = "", title = "", models = ""
     var session: Limit?, week: Limit?
+    var sessionOff = false   // 5-часовое окно отключено сервисом (упёрлись в недельный лимит)
+
+    // короткое окно для часов и значка: если 5 часов не действует — упираемся в неделю
+    var short: Limit? { session ?? (sessionOff ? week : nil) }
 }
 
 struct AppSettings {
@@ -423,18 +427,38 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         if agyFetching || (!s.showAgy && !probe) { return }
         agyFetching = true
         agyNextFetch = Date().addingTimeInterval(TimeInterval(s.refreshMinutes * 60))
+        updateAgy(minutes: s.refreshMinutes)
         updateView()
         DispatchQueue.global().async {
             var quota: String?, credits: String?
             var missing = true
             if let exe = Widget.agyExe {
-                let q = Proc.run(exe, ["-p", "/quota", "--output-format", "json"])
+                // при опросе автообновление agy выключаем — обновляем его сами, отдельно (updateAgy)
+                var env = Shell.environment
+                env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
+                let q = Proc.run(exe, ["-p", "/quota", "--output-format", "json"], env: env)
                 quota = q.output
                 missing = q.missing
-                if quota != nil { credits = Proc.run(exe, ["-p", "/credits", "--output-format", "json"]).output }
+                if quota != nil { credits = Proc.run(exe, ["-p", "/credits", "--output-format", "json"], env: env).output }
             }
             let email = Widget.readAgyEmail()
             DispatchQueue.main.async { self.fetchAgyDone(quota, credits, email, missing) }
+        }
+    }
+
+    // «agy update» в фоне и отдельно от опроса: лимиты не ждут обновления.
+    // Проверяем с тем же интервалом, что и лимиты; пока одно обновление идёт, второе не запускаем.
+    private var agyUpdateCheck = Date.distantPast
+    private var agyUpdating = false
+
+    func updateAgy(minutes: Int) {
+        if agyUpdating || Date() < agyUpdateCheck.addingTimeInterval(TimeInterval(minutes * 60)) { return }
+        guard let exe = Widget.agyExe else { return }
+        agyUpdateCheck = Date()
+        agyUpdating = true
+        DispatchQueue.global().async {
+            _ = Proc.run(exe, ["update"], timeout: 600)
+            DispatchQueue.main.async { self.agyUpdating = false }
         }
     }
 
@@ -494,8 +518,12 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             for b in buckets {
                 let id = J.string(b["id"]) ?? ""
                 if g.key.isEmpty, let dash = id.lastIndex(of: "-"), dash > id.startIndex { g.key = String(id[..<dash]) }
-                guard let remaining = J.double(b["remaining_fraction"]) else { continue }   // окно сейчас не действует
                 let window = J.string(b["window"])
+                // окно сейчас не действует: «disabled» приходит вместе с remaining_fraction = 1, это не «0% израсходовано»
+                guard let remaining = J.double(b["remaining_fraction"]), J.bool(b["disabled"]) != true else {
+                    if window == "5h" { g.sessionOff = true }
+                    continue
+                }
                 let l = Limit(key: id, title: "", percent: max(0, min(100, (1 - remaining) * 100)), resetsAt: Fmt.iso(b["reset_time"]))
                 if window == "5h" { g.session = l } else if window == "weekly" { g.week = l }
             }
@@ -773,7 +801,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
                 let g = agyGroups.first { $0.key == key }
                 // пока данных нет — столбец всё равно показываем («—»), чтобы надпись не прыгала
                 shown = s.showAgy && !agyMissing && (g != nil || agyGroups.isEmpty)
-                limits = [g?.session, g?.week]
+                limits = [g?.short, g?.week]
             }
             guard shown && clockShows(key) else { continue }
             let extra = extras.first { $0.key == key }
@@ -806,12 +834,12 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         }
         // главное число — сессия Claude; если Claude скрыт — сессия Antigravity
         let ag = s.showAgy ? clockGroup() : nil
-        let agyPct = current(ag?.session, now)
+        let agyPct = current(ag?.short, now)
         let claudeMain = s.showClaude
-        let known = claudeMain ? session != nil : ag?.session != nil
+        let known = claudeMain ? session != nil : ag?.short != nil
         let active = session?.resetsAt.map { $0 > now } ?? false
         let main = claudeMain ? (active ? session!.percent : 0) : agyPct
-        let stripe = claudeMain && ag?.session != nil   // полоска снизу цвета группы — сессия Antigravity
+        let stripe = claudeMain && ag?.short != nil   // полоска снизу цвета группы — сессия Antigravity
         let agyColor = ag.map { Pal.group($0.key) } ?? Pal.gemini
         let key = "badge|\(known ? String(Int(main.rounded())) : "-")|\(claudeMain)|\(stripe ? String(Int(agyPct.rounded())) + (ag?.key ?? "") : "")"
         if key == lastIconKey { return }
@@ -827,7 +855,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             let active = sess.resetsAt.map { $0 > now } ?? false
             tip.append("Claude " + Fmt.pct(active ? sess.percent : 0) + (weekly.isEmpty ? "" : " (нед. " + Fmt.pct(current(weekly[0], now)) + ")"))
         }
-        if s.showAgy { for g in agyGroups { tip.append((g.key == "3p" ? "Claude/GPT" : g.title) + " " + Fmt.pct(current(g.session, now))) } }
+        if s.showAgy { for g in agyGroups { tip.append((g.key == "3p" ? "Claude/GPT" : g.title) + " " + Fmt.pct(current(g.short, now))) } }
         if s.showCodex, let l = codexLimits.first { tip.append("Codex " + Fmt.pct(current(l, now))) }
         for p in shownExtras { if let l = p.short { tip.append(p.name + " " + Fmt.pct(current(l, now))) } }
         return tip.isEmpty ? "Лимиты ИИ" : "Сверху — сессия, снизу — неделя\n" + tip.joined(separator: " · ")

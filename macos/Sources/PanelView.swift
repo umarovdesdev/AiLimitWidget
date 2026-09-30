@@ -233,7 +233,7 @@ struct AgyRow: View {
                 Spacer(minLength: 0)
             }
             HStack(alignment: .top, spacing: 14) {
-                MiniBar(label: "5 часов", l: g.session, now: now, accent: color)
+                MiniBar(label: "5 часов", l: g.session, now: now, accent: color, offText: g.sessionOff ? "не действует — неделя исчерпана" : nil)
                 MiniBar(label: "Неделя", l: g.week, now: now, accent: color)
             }
             .padding(.top, 3)
@@ -251,6 +251,7 @@ struct MiniBar: View {
     let l: Limit?
     let now: Date
     let accent: NSColor
+    var offText: String? = nil
 
     var body: some View {
         let pct = current(l, now)
@@ -265,14 +266,14 @@ struct MiniBar: View {
             Bar(pct: pct, color: color, height: 5)
             if let text = caption(pct) {
                 Text(text).font(.system(size: 10.5)).foregroundColor(Ink.tertiary).lineLimit(1).padding(.top, 3)
-                    .help(l?.resetsAt.map(Fmt.resetMoment) ?? "")
+                    .help(l?.resetsAt.map(Fmt.resetMoment) ?? (l == nil ? offText ?? "" : ""))
             }
         }
         .frame(maxWidth: .infinity)
     }
 
     func caption(_ pct: Double) -> String? {
-        guard let l = l else { return "не действует" }
+        guard let l = l else { return offText ?? "не действует" }
         if pct < 0.5 { return "не расходовался" }
         if let at = l.resetsAt, at > now { return "сброс через " + Fmt.duration(at.timeIntervalSince(now)) }
         return nil

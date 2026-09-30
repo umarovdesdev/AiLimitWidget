@@ -10,7 +10,7 @@
 
 | ОС | Файл | Примечание |
 |---|---|---|
-| macOS | [AiLimitWidget.dmg](release/AiLimitWidget.dmg) | Apple Silicon (M1 и новее); для Intel соберите из исходников |
+| macOS | [AiLimitWidget.dmg](release/AiLimitWidget.dmg) | Apple Silicon и Intel, macOS 12+ |
 | Windows | [AiLimitWidget.exe](release/AiLimitWidget.exe) | один файл, установка не нужна |
 
 Приложения не подписаны, поэтому при первом запуске система может предупредить:

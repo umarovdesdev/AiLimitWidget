@@ -71,7 +71,13 @@ PLIST
     # DMG для раздачи: лежит в release/ рядом с .exe для Windows (коммитится в git)
     mkdir -p ../release
     rm -f "../release/$NAME.dmg"
-    hdiutil create -volname "$DISPLAY" -srcfolder "$APP" -ov -format UDZO "../release/$NAME.dmg" >/dev/null
+    # внутри DMG — приложение и ярлык «Программы»: достаточно перетащить одно на другое
+    local STAGE="build/dmg"
+    rm -rf "$STAGE" && mkdir -p "$STAGE"
+    ditto "$APP" "$STAGE/$NAME.app"
+    ln -s /Applications "$STAGE/Applications"
+    hdiutil create -volname "$DISPLAY" -srcfolder "$STAGE" -ov -format UDZO "../release/$NAME.dmg" >/dev/null
+    rm -rf "$STAGE"
     echo "    готово: $APP и release/$NAME.dmg"
 }
 

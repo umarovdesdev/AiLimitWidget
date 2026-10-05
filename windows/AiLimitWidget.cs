@@ -870,7 +870,7 @@ namespace AiLimitWidget
         [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hwnd, int index);
         [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr hwnd, int index, int value);
         static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
-        const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOREDRAW = 0x8, SWP_NOACTIVATE = 0x10, SWP_NOOWNERZORDER = 0x200;
+        const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOREDRAW = 0x8, SWP_NOACTIVATE = 0x10, SWP_NOOWNERZORDER = 0x200;
         const int GWL_EXSTYLE = -20, WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000, WS_EX_TRANSPARENT = 0x20;
         const double ChevronOverlap = -7.8;   // надпись заходит на пустое поле кнопки ^ (клики проходят насквозь)
 
@@ -1116,17 +1116,16 @@ namespace AiLimitWidget
                 ok = tb.Top < screen.Bottom - 4 && !FullscreenApp(tb);   // панель не спрятана и нет полноэкранного приложения
                 if (ok)
                 {
-                    if (!clock.IsVisible) clock.Show();
-                    IntPtr hwnd = new WindowInteropHelper(clock).Handle;
+                    IntPtr hwnd = new WindowInteropHelper(clock).EnsureHandle();
                     OwnByTaskbar(hwnd, bar);
                     var source = PresentationSource.FromVisual(clock);
                     double scale = source != null && source.CompositionTarget != null ? source.CompositionTarget.TransformToDevice.M11 : 1;
-                    double left = nr.Left / scale - clock.ActualWidth + ChevronOverlap;   // вплотную к стрелке трея
-                    double top = (tb.Top + tb.Bottom) / 2.0 / scale - clock.ActualHeight / 2;
-                    if (Math.Abs(clock.Left - left) > 0.5) clock.Left = left;
-                    if (Math.Abs(clock.Top - top) > 0.5) clock.Top = top;
-                    // на всякий случай держим надпись поверх (без перерисовки и без смены фокуса)
-                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER);
+                    int labelWidthPx = (int)(clock.ActualWidth * scale);
+                    int labelHeightPx = (int)(clock.ActualHeight * scale);
+                    int x = (int)(nr.Left - labelWidthPx + ChevronOverlap * scale);
+                    int y = (tb.Top + tb.Bottom) / 2 - labelHeightPx / 2;
+                    SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER);
+                    if (!clock.IsVisible) clock.Show();
                     return;
                 }
             }
@@ -2022,14 +2021,30 @@ namespace AiLimitWidget
             timer.Start();
 
             UpdateView();
-            FetchAll();
+            uint uptimeMs = unchecked((uint)Environment.TickCount);
+            if (uptimeMs < 3 * 60 * 1000)
+            {
+                int delayMs = Math.Max(60000, (int)(3 * 60 * 1000 - uptimeMs));
+                DateTime startAt = DateTime.Now.AddMilliseconds(delayMs);
+                startDelayUntil = startAt;
+                nextFetch = startAt;
+                agyNextFetch = startAt;
+                codexNextFetch = startAt;
+                foreach (var x in extras) x.NextFetch = startAt;
+            }
+            else
+            {
+                FetchAll();
+            }
         }
 
         bool activeSinceShow;
         DateTime hiddenAt = DateTime.MinValue;
+        DateTime startDelayUntil = DateTime.MinValue;   // сразу после включения ПК ничего не запускаем — Windows и так загружена
 
         void Tick()
         {
+            if (DateTime.Now < startDelayUntil) { UpdateView(); return; }
             // окно лимита закончилось — сразу спрашиваем новые данные
             bool expired = session != null && session.ResetsAt.HasValue && session.ResetsAt.Value <= DateTime.Now;
             if (!fetching && (DateTime.Now >= nextFetch || (expired && DateTime.Now >= nextFetch.AddMinutes(-settings.RefreshMinutes).AddSeconds(20))))
@@ -2469,11 +2484,23 @@ namespace AiLimitWidget
         // окно всплывает над панелью задач, как календарь у часов: справа внизу, над надписью
         void Dock()
         {
-            if (window == null || !window.IsVisible) return;
-            double w = window.ActualWidth, h = window.ActualHeight;
-            var wa = SystemParameters.WorkArea;
-            window.Left = wa.Right - w - DockMargin;
-            window.Top = wa.Bottom - h - DockMargin;
+            if (window == null) return;
+            IntPtr hwnd = new WindowInteropHelper(window).EnsureHandle();
+            if (hwnd == IntPtr.Zero) return;
+            IntPtr bar = FindWindow("Shell_TrayWnd", null);
+            var work = bar != IntPtr.Zero ? WinForms.Screen.FromHandle(bar).WorkingArea : WinForms.Screen.PrimaryScreen.WorkingArea;
+            RECT r;
+            if (GetWindowRect(hwnd, out r))
+            {
+                int widthPx = r.Right - r.Left;
+                int heightPx = r.Bottom - r.Top;
+                var source = PresentationSource.FromVisual(window);
+                double scale = source != null && source.CompositionTarget != null ? source.CompositionTarget.TransformToDevice.M11 : 1;
+                int margin = (int)(DockMargin * scale);
+                int x = work.Right - widthPx - margin;
+                int y = work.Bottom - heightPx - margin;
+                SetWindowPos(hwnd, IntPtr.Zero, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
 
         public void ShowWidget()
@@ -2481,6 +2508,8 @@ namespace AiLimitWidget
             preview = false;
             activeSinceShow = false;
             UpdateView();
+            new WindowInteropHelper(window).EnsureHandle();
+            Dock();
             window.Show();
             window.UpdateLayout();   // размер окна известен сразу — ставим его точно в правый нижний угол
             Dock();
@@ -3298,8 +3327,10 @@ namespace AiLimitWidget
             {
                 IntPtr nulHandle = nul.DangerousGetHandle();
                 SetHandleInformation(nulHandle, 1, 1);   // HANDLE_FLAG_INHERIT
+                string desktop = Desktop();
+                if (desktop == null) return null;
                 var si = new STARTUPINFO {
-                    lpDesktop = Desktop(), dwFlags = 0x101 /* STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES */, wShowWindow = 0 /* SW_HIDE */,
+                    lpDesktop = desktop, dwFlags = 0x101 /* STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES */, wShowWindow = 0 /* SW_HIDE */,
                     hStdInput = nulHandle, hStdOutput = pipe.ClientSafePipeHandle.DangerousGetHandle(), hStdError = nulHandle };
                 si.cb = Marshal.SizeOf(si);
                 PROCESS_INFORMATION pi;

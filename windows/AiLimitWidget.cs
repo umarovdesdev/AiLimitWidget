@@ -1997,7 +1997,11 @@ namespace AiLimitWidget
                 if (!activeSinceShow || settings.KeepOpen || (menu != null && menu.IsOpen)) return;
                 HideWidget();
             };
-            window.SizeChanged += (s, e) => Dock();
+            window.SizeChanged += (s, e) =>
+            {
+                Dock();
+                dispatcher.BeginInvoke(new Action(Dock), DispatcherPriority.Loaded);   // ещё раз — когда WPF уже поменял размер окна
+            };
             SystemEvents.DisplaySettingsChanged += (s, e) => dispatcher.BeginInvoke(new Action(Dock));
 
             menu = new ContextMenu { Style = (Style)MenuStyles["DarkMenu"], Placement = System.Windows.Controls.Primitives.PlacementMode.MousePoint };
@@ -2492,10 +2496,11 @@ namespace AiLimitWidget
             RECT r;
             if (GetWindowRect(hwnd, out r))
             {
-                int widthPx = r.Right - r.Left;
-                int heightPx = r.Bottom - r.Top;
                 var source = PresentationSource.FromVisual(window);
                 double scale = source != null && source.CompositionTarget != null ? source.CompositionTarget.TransformToDevice.M11 : 1;
+                // в SizeChanged настоящее окно ещё старого размера — берём новый размер из WPF, иначе окно уезжает под панель задач
+                int widthPx = window.ActualWidth > 0 ? (int)Math.Round(window.ActualWidth * scale) : r.Right - r.Left;
+                int heightPx = window.ActualHeight > 0 ? (int)Math.Round(window.ActualHeight * scale) : r.Bottom - r.Top;
                 int margin = (int)(DockMargin * scale);
                 int x = work.Right - widthPx - margin;
                 int y = work.Bottom - heightPx - margin;

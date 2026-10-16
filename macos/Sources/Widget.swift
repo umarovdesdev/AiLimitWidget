@@ -202,6 +202,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     let popover = NSPopover()
     var hosting: NSHostingController<PanelView>!
     var preview = false                         // панель открыта наведением, а не нажатием
+    var maxPanelHeight: CGFloat = 800           // панель не выше видимой части экрана — лишнее уходит в прокрутку
     var hoverSince: Date?
     var hiddenAt = Date.distantPast
     var lastIconKey: String?
@@ -1039,6 +1040,9 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
 
     private func present() {
         popover.behavior = preview ? .applicationDefined : .transient
+        if let screen = statusItem.button?.window?.screen ?? NSScreen.main {
+            maxPanelHeight = screen.visibleFrame.height - 24   // стрелка панели и зазор до низа экрана
+        }
         updateView()
         if !popover.isShown, let b = statusItem.button {
             if #available(macOS 13.0, *) {} else { popover.contentSize = hosting.view.fittingSize }

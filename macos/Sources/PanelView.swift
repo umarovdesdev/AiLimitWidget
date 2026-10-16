@@ -10,20 +10,33 @@ enum Ink {
 
 struct PanelView: View {
     @ObservedObject var w: Widget
+    @State var headerHeight: CGFloat = 0
+    @State var contentHeight: CGFloat = 0
 
     var body: some View {
         let now = Date()
+        let top: CGFloat = w.preview ? 2 : 12, bottom: CGFloat = w.preview ? 12 : 14
+        // много ИИ — список прокручивается, шапка остаётся на месте, панель не выходит за экран
+        let maxScroll = max(120, w.maxPanelHeight - top - bottom - (w.preview ? 0 : headerHeight))
         VStack(alignment: .leading, spacing: 0) {
             // открыта наведением — только полосы лимитов и время сброса, без шапки и подробностей
-            if !w.preview { header }
-            if w.confirmLogout || w.loggingOut {
-                LogoutPanel(w: w)
-            } else {
-                sections(now)
+            if !w.preview { header.padding(.trailing, 12).background(HeightReader { headerHeight = $0 }) }
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 0) {
+                    if w.confirmLogout || w.loggingOut {
+                        LogoutPanel(w: w)
+                    } else {
+                        sections(now)
+                    }
+                    if !w.preview && !w.confirmLogout && !w.loggingOut { DetailsView(w: w, now: now) }
+                }
+                .padding(.trailing, 12)   // полоса прокрутки — в этом отступе, поверх текста не ложится
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .background(HeightReader { contentHeight = $0 })
             }
-            if !w.preview && !w.confirmLogout && !w.loggingOut { DetailsView(w: w, now: now) }
+            .frame(height: min(contentHeight, maxScroll))
         }
-        .padding(EdgeInsets(top: w.preview ? 2 : 12, leading: 14, bottom: w.preview ? 12 : 14, trailing: 12))
+        .padding(EdgeInsets(top: top, leading: 14, bottom: bottom, trailing: 0))
         .frame(width: 344, alignment: .topLeading)
         .background(Tint(level: w.s.transparency))
         .environment(\.colorScheme, .dark)
@@ -96,6 +109,16 @@ struct PanelView: View {
             Hint(w.anyFetching || !w.agyChecked ? "Ищем ИИ, в которые вы вошли…"
                  : "На этом Mac нет входа ни в один ИИ.\nВойдите в Claude Code, Codex, Gemini CLI или Antigravity — лимиты появятся здесь сами.")
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// высота содержимого — чтобы прокрутка была не выше нужного
+struct HeightReader: View {
+    let onChange: (CGFloat) -> Void
+    var body: some View {
+        GeometryReader { g in
+            Color.clear.onAppear { onChange(g.size.height) }.onChange(of: g.size.height) { onChange($0) }
         }
     }
 }

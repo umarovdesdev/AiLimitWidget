@@ -3,6 +3,7 @@
 // Gemini CLI: вход из ~/.gemini/oauth_creds.json, лимиты — тот же запрос, что /stats в самом Gemini CLI.
 // GitHub Copilot: вход Copilot CLI (связка ключей или ~/.copilot), плагина Copilot или gh; месячный лимит премиум-запросов.
 // Cursor: вход из базы Cursor (state.vscdb), расход за текущий месяц подписки.
+// Любой другой ИИ — файлом <имя>.json в папке providers (см. ниже), без пересборки виджета.
 // Входы только читаем: обновлённый токен Gemini держим в памяти и в файл не пишем.
 
 import AppKit
@@ -38,7 +39,9 @@ struct ExtraResult {
 }
 
 enum Extra {
-    static let all: [(key: String, name: String, color: String)] = [
+    // встроенные ИИ; к ним добавляются описания из папки providers (scanProviders) — без пересборки виджета.
+    // Меняется только в основном потоке.
+    static var all: [(key: String, name: String, color: String)] = [
         ("geminicli", "Gemini CLI", "#8AB4F8"),   // голубой
         ("copilot", "GitHub Copilot", "#BF5AF2"),  // фиолетовый
         ("cursor", "Cursor", "#40C8E0")            // бирюзовый
@@ -49,9 +52,83 @@ enum Extra {
         case "geminicli": return gemini()
         case "copilot": return copilot()
         case "cursor": return cursor()
-        default: return ExtraResult(signedIn: false)
+        default:
+            lock.lock()
+            let def = providers[key]
+            lock.unlock()
+            return def.map { provider(key, $0) } ?? ExtraResult(signedIn: false)
         }
     }
+
+    // ---------- ИИ из папки providers ----------
+    // ~/Library/Application Support/AiLimitWidget/providers/<имя>.json: { "name": "Grok", "color": "#RRGGBB" (можно не указывать),
+    //   "command": "python3", "args": "~/scripts/grok.py", "timeout": 30 }
+    // Команда печатает JSON: { "signed_in": true, "plan": "Pro", "email": "…", "problem": null,
+    //   "limits": [ { "title": "Неделя", "percent": 12.5, "resets_at": "2026-10-20T10:00:00Z", "window_seconds": 604800 } ] }
+    // percent — сколько израсходовано (0…100); вместо него можно remaining — сколько осталось (0…100).
+    // Новый файл подхватывается на ходу: ИИ сам появляется в панели, в «Показывать» и в строке меню.
+    private static var providers: [String: JSON] = [:]
+    private static let lock = NSLock()
+    static let autoColors = ["#FF6482", "#66D4CF", "#A8E05F", "#AC8E68", "#DA8FFF", "#FFB8A0"]
+
+    static var providersDir: String {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!.path
+        return support + "/AiLimitWidget/providers"
+    }
+
+    // вызывается из основного потока: возвращает только что найденные ИИ
+    static func scanProviders() -> [(key: String, name: String, color: String)] {
+        var found: [(key: String, name: String, color: String)] = []
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: providersDir, withIntermediateDirectories: true)
+        let files = ((try? fm.contentsOfDirectory(atPath: providersDir)) ?? [])
+            .filter { $0.lowercased().hasSuffix(".json") }.sorted { $0.lowercased() < $1.lowercased() }
+        for f in files {
+            guard let d = J.file(providersDir + "/" + f), let name = J.string(d["name"]), !name.isEmpty,
+                  let cmd = J.string(d["command"]), !cmd.isEmpty else { continue }
+            let key = "p-" + String(f.dropLast(5)).lowercased().replacingOccurrences(of: ",", with: "-").replacingOccurrences(of: " ", with: "-")
+            lock.lock(); providers[key] = d; lock.unlock()   // изменённый файл действует со следующего обновления
+            if all.contains(where: { $0.key == key }) { continue }
+            var color = J.string(d["color"]) ?? ""
+            if color.range(of: "^#[0-9A-Fa-f]{6}$", options: .regularExpression) == nil {
+                color = autoColors.first { c in !all.contains { $0.color.caseInsensitiveCompare(c) == .orderedSame } }
+                    ?? autoColors[found.count % autoColors.count]
+            }
+            let entry = (key: key, name: name, color: color)
+            all.append(entry)
+            found.append(entry)
+        }
+        return found
+    }
+
+    // «args» — строка (как в оболочке) или массив; команда ищется в PATH пользователя
+    static func provider(_ key: String, _ def: JSON) -> ExtraResult {
+        let name = J.string(def["name"]) ?? key
+        let file = String(key.dropFirst(2)) + ".json"
+        let command = J.string(def["command"]) ?? ""
+        var line = command.contains("/") ? quote(command) : (Shell.find(command).map(quote) ?? command)
+        if let list = def["args"] as? [Any] { line += " " + list.compactMap(J.string).map(quote).joined(separator: " ") }
+        else if let a = J.string(def["args"]), !a.isEmpty { line += " " + a }
+        let timeout = max(5, min(300, J.double(def["timeout"]) ?? 30))
+        let out = Proc.run("/bin/sh", ["-c", line], timeout: timeout)
+        if out.missing { return ExtraResult(problem: name + ": команда не запускается — проверьте command в " + file) }
+        let text = out.output?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let d = J.obj(text) ?? J.embedded(text) else { return ExtraResult(problem: name + " не ответил или ответ не JSON") }
+        if J.bool(d["signed_in"]) == false { return ExtraResult(signedIn: false) }
+        var r = ExtraResult(plan: J.string(d["plan"]) ?? "", email: J.string(d["email"]), problem: J.string(d["problem"]))
+        var list: [Limit] = []
+        for l in (d["limits"] as? [JSON]) ?? [] {
+            guard let used = J.double(l["percent"]) ?? J.double(l["remaining"]).map({ 100 - $0 }) else { continue }
+            let at = Fmt.iso(l["resets_at"]) ?? J.double(l["resets_at"]).map { Date(timeIntervalSince1970: $0) }
+            list.append(Limit(key: key + "-\(list.count)", title: J.string(l["title"]) ?? "Лимит", percent: max(0, min(100, used)),
+                              resetsAt: at, windowSeconds: Int64(J.double(l["window_seconds"]) ?? 0)))
+        }
+        r.limits = list.sorted { $0.windowSeconds < $1.windowSeconds }   // в строке меню сверху — самое короткое окно, снизу — самое длинное
+        if r.limits.isEmpty && r.problem == nil { r.problem = "Сервер не сообщил лимиты" }
+        return r
+    }
+
+    static func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
     // ---------- HTTP в фоне ----------
     static func http(_ url: String, method: String = "GET", headers: [String: String] = [:], body: Data? = nil) -> (Int, String?) {
@@ -198,21 +275,24 @@ enum Extra {
         let resetAt = Fmt.iso(d["quota_reset_date_utc"]) ?? day(J.string(d["quota_reset_date"]) ?? J.string(d["limited_user_reset_date"]))
         let month: Int64 = 30 * 86400
         let names = ["premium_interactions": "Премиум-запросы · месяц", "chat": "Чат · месяц", "completions": "Дополнения · месяц"]
+        let known = ["premium_interactions", "chat", "completions"]
+        // известные — в привычном порядке, новые — после них, с названием из ключа
+        func title(_ key: String) -> String { names[key] ?? capital(key.replacingOccurrences(of: "_", with: " ")) + " · месяц" }
         if let snaps = d["quota_snapshots"] as? JSON {
-            for key in ["premium_interactions", "chat", "completions"] {
+            for key in known + snaps.keys.filter({ !known.contains($0) }).sorted() {
                 guard let s = snaps[key] as? JSON, J.bool(s["unlimited"]) != true else { continue }
                 let left = J.double(s["percent_remaining"]) ?? {
                     guard let e = J.double(s["entitlement"]), e > 0, let rem = J.double(s["remaining"]) else { return nil }
                     return rem / e * 100
                 }()
                 guard let l = left else { continue }
-                r.limits.append(Limit(key: "copilot-" + key, title: names[key]!, percent: max(0, min(100, 100 - l)), resetsAt: resetAt, windowSeconds: month))
+                r.limits.append(Limit(key: "copilot-" + key, title: title(key), percent: max(0, min(100, 100 - l)), resetsAt: resetAt, windowSeconds: month))
             }
         } else if let left = d["limited_user_quotas"] as? JSON, let total = d["monthly_quotas"] as? JSON {
             // бесплатный Copilot: сколько осталось из месячной нормы
-            for key in ["chat", "completions"] {
+            for key in known + total.keys.filter({ !known.contains($0) }).sorted() {
                 guard let t = J.double(total[key]), t > 0, let rem = J.double(left[key]) else { continue }
-                r.limits.append(Limit(key: "copilot-" + key, title: names[key]!, percent: max(0, min(100, (t - rem) / t * 100)), resetsAt: resetAt, windowSeconds: month))
+                r.limits.append(Limit(key: "copilot-" + key, title: title(key), percent: max(0, min(100, (t - rem) / t * 100)), resetsAt: resetAt, windowSeconds: month))
             }
         }
         if r.limits.isEmpty { r.problem = "Без ограничений по тарифу" }

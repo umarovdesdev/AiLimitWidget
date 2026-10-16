@@ -38,6 +38,8 @@ struct AppSettings {
     var showClaude = true, showAgy = true, showCodex = true
     var showDetails = false
     var clockItems = "claude,gemini,3p,codex,geminicli,copilot,cursor"
+    var agyKeys = "gemini,3p"    // группы Antigravity, которые уже встречались: новая (например, Gemini 4 Argon) сама получает столбец в строке меню
+    var seenExtras = ""          // ИИ из папки providers, которые уже встречались: новый сам получает столбец в строке меню
     var hiddenExtras = ""        // другие ИИ (Gemini CLI, Copilot, Cursor), которые выключили в «Показывать»
     var loggedOut = ""           // сервисы, скрытые из-за выхода: вернутся сами, когда в них снова войдут
 }
@@ -52,9 +54,20 @@ enum Pal {
         case "claude": return accent
         case "gemini": return gemini
         case "codex": return codex
-        default: return agyClaude
+        case "3p": return agyClaude   // Claude и GPT в Antigravity
+        default:
+            if let x = Extra.all.first(where: { $0.key == key }) { return NSColor(hex: x.color) }
+            // новые группы Antigravity: Argon — индиго (аргон светится фиолетовым), остальные — из запасной палитры;
+            // цвет зависит только от названия группы, поэтому не меняется между запусками
+            if key.contains("argon") { return NSColor(hex: "#7D7AFF") }
+            var h = 0
+            for ch in key.unicodeScalars { h = (h &* 31 &+ Int(ch.value)) & 0x7FFFFFFF }
+            return NSColor(hex: spare[h % spare.count])
         }
     }
+
+    // не повторяют цвета сервисов и не похожи на оранжевый/красный, которыми помечаются почти исчерпанные лимиты
+    static let spare = ["#FF6482", "#66D4CF", "#A8E05F", "#AC8E68", "#DA8FFF"]
 
     static func severity(_ pct: Double, _ normal: NSColor = accent) -> NSColor { pct >= 90 ? danger : pct >= 75 ? warn : normal }
 }
@@ -77,11 +90,66 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     static let launchLabel = "com.asror.AiLimitWidget"
     static let refreshOptions = [1, 2, 5, 10]
     static let notifyThresholds = [95, 80]
-    // недельные лимиты, которые показываем строками (остальные поля ответа — служебные)
-    static let weeklyKeys = [("seven_day", "Неделя · все модели"), ("seven_day_opus", "Неделя · Opus"), ("seven_day_sonnet", "Неделя · Sonnet")]
-    // столбцы в строке меню, слева направо
-    static let clockColumns = [("claude", "Claude Code"), ("gemini", "Gemini"), ("3p", "Claude и GPT (Antigravity)"), ("codex", "Codex")]
-        + Extra.all.map { ($0.key, $0.name) }
+    // известные лимиты Claude — с понятными названиями и в этом порядке; остальные лимиты из ответа
+    // (новые, которых тут нет) показываются после них сами — с названием из ключа или суммой в долларах
+    static let weeklyKeys = [("seven_day", "Неделя · все модели"), ("seven_day_opus", "Неделя · Opus"), ("seven_day_sonnet", "Неделя · Sonnet"),
+                             ("seven_day_cowork", "Неделя · Cowork"), ("seven_day_oauth_apps", "Неделя · приложения")]
+
+    static func limitTitle(_ key: String, _ o: JSON) -> String {
+        if let known = weeklyKeys.first(where: { $0.0 == key }) { return known.1 }
+        if let limit = J.double(o["limit_dollars"]) {
+            let used = ((J.double(o["used_dollars"]) ?? 0) * 100).rounded() / 100
+            return "Кредиты: $" + num(used) + " из $" + num(limit)
+        }
+        let name = (key.hasPrefix("seven_day_") ? String(key.dropFirst(10)) : key).replacingOccurrences(of: "_", with: " ")
+        return key.hasPrefix("seven_day") ? "Неделя · " + Extra.capital(name) : Extra.capital(name)
+    }
+
+    static func num(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
+
+    static func agyColumnTitle(_ key: String, _ title: String?) -> String {
+        key == "gemini" ? "Gemini" : key == "3p" ? "Claude и GPT (Antigravity)" : (title ?? key) + " (Antigravity)"
+    }
+
+    // столбцы в строке меню, слева направо: Claude Code, все группы Antigravity, Codex, другие ИИ
+    var clockColumns: [(String, String)] {
+        let agy = s.agyKeys.split(separator: ",").map(String.init).filter { !$0.isEmpty }.map { k in
+            (k, Widget.agyColumnTitle(k, agyGroups.first { $0.key == k }?.title))
+        }
+        return [("claude", "Claude Code")] + agy + [("codex", "Codex")] + extras.map { ($0.key, $0.name) }
+    }
+
+    // новые ключи (группа Antigravity или ИИ из providers): запоминаем и один раз включаем их столбцы в строке меню
+    func enableColumns(_ fresh: [String]) {
+        let items = s.clockItems.split(separator: ",").map(String.init).filter { !$0.isEmpty } + fresh
+        s.clockItems = clockColumns.map { $0.0 }.filter { items.contains($0) }.joined(separator: ",")
+        lastIconKey = nil
+        saveSettings()
+    }
+
+    func rememberAgyKeys() {
+        let known = s.agyKeys.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        let fresh = agyGroups.map { $0.key }.filter { !$0.isEmpty && !$0.contains(",") && !known.contains($0) }
+        if fresh.isEmpty { return }
+        s.agyKeys = (known + fresh).joined(separator: ",")
+        enableColumns(fresh)
+    }
+
+    // новые файлы в папке providers: ИИ появляется в панели и в меню, а в строке меню — один раз включается его столбец
+    private var providersScan = Date.distantPast
+
+    func syncProviders() {
+        if Date() < providersScan { return }   // папку смотрим не чаще раза в 10 с
+        providersScan = Date().addingTimeInterval(10)
+        let found = Extra.scanProviders()
+        if found.isEmpty { return }
+        extras += found.map { ExtraProvider(key: $0.key, name: $0.name, color: NSColor(hex: $0.color)) }
+        let seen = s.seenExtras.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        let fresh = found.map { $0.key }.filter { !seen.contains($0) }
+        if fresh.isEmpty { return }
+        s.seenExtras = (seen + fresh).joined(separator: ",")
+        enableColumns(fresh)
+    }
 
     let dir: String
     var s = AppSettings()
@@ -122,7 +190,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     var codexNextFetch = Date.distantPast
 
     // ---------- другие ИИ ----------
-    let extras = Extra.all.map { ExtraProvider(key: $0.key, name: $0.name, color: NSColor(hex: $0.color)) }
+    var extras = Extra.all.map { ExtraProvider(key: $0.key, name: $0.name, color: NSColor(hex: $0.color)) }
 
     // ---------- окно ----------
     var statusItem: NSStatusItem!
@@ -235,11 +303,13 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             if let v = J.string(d["ClockItems"]) { s.clockItems = v }
             if let v = J.string(d["LoggedOut"]) { s.loggedOut = v }
             if let v = J.string(d["HiddenExtras"]) { s.hiddenExtras = v }
+            if let v = J.string(d["AgyKeys"]) { s.agyKeys = v }
+            if let v = J.string(d["SeenExtras"]) { s.seenExtras = v }
             // настройки старой версии: столбцы других ИИ в строке меню включены по умолчанию
             if J.bool(d["ClockExtras"]) == nil { s.clockItems += "," + Extra.all.map { $0.key }.joined(separator: ",") }
         }
         if !Widget.refreshOptions.contains(s.refreshMinutes) { s.refreshMinutes = 2 }
-        if !Widget.clockColumns.contains(where: { clockShows($0.0) }) { s.clockItems = "claude,gemini,3p,codex" }
+        if !clockColumns.contains(where: { clockShows($0.0) }) { s.clockItems = "claude,gemini,3p,codex" }
         if !s.showClaude && !s.showAgy && !s.showCodex { s.showClaude = true }
     }
 
@@ -247,7 +317,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         J.write(["Transparency": s.transparency, "RefreshMinutes": s.refreshMinutes, "Notify": s.notify,
                  "ClockLabel": s.clockLabel, "ShowClaude": s.showClaude, "ShowAgy": s.showAgy, "ShowCodex": s.showCodex,
                  "ShowDetails": s.showDetails, "ClockItems": s.clockItems, "LoggedOut": s.loggedOut,
-                 "HiddenExtras": s.hiddenExtras, "ClockExtras": true] as [String: Any], settingsPath)
+                 "HiddenExtras": s.hiddenExtras, "AgyKeys": s.agyKeys, "SeenExtras": s.seenExtras, "ClockExtras": true] as [String: Any], settingsPath)
     }
 
     // ---------- данные Claude ----------
@@ -318,6 +388,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         fetch()
         fetchAgy()
         fetchCodex()
+        syncProviders()
         for p in extras { fetchExtra(p) }
         checkReturn(true)   // заодно — не вошли ли снова в скрытые после выхода сервисы
     }
@@ -386,7 +457,11 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     func parse(_ text: String) -> Bool {
         guard let d = J.obj(text) else { return false }
         session = Widget.readLimit(d, "five_hour", "Сессия (5 ч)") ?? Limit(key: "five_hour", title: "Сессия (5 ч)", percent: 0, resetsAt: nil)
-        weekly = Widget.weeklyKeys.compactMap { Widget.readLimit(d, $0.0, $0.1) }
+        let known = Widget.weeklyKeys.map { $0.0 }
+        weekly = (known + d.keys.filter { $0 != "five_hour" && $0 != "extra_usage" && !known.contains($0) }.sorted()).compactMap { k in
+            guard let o = d[k] as? JSON, J.double(o["utilization"]) != nil else { return nil }
+            return Widget.readLimit(d, k, Widget.limitTitle(k, o))
+        }
         breakdown = ((d["seven_day_breakdown"] as? JSON)?["rows"] as? [JSON] ?? []).compactMap { r -> (String, Double)? in
             guard let p = J.double(r["percent"]) else { return nil }
             return (J.string(r["display_name"]) ?? "", p)
@@ -534,6 +609,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             list.append(g)
         }
         agyGroups = list
+        rememberAgyKeys()
         return true
     }
 
@@ -657,7 +733,8 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         codexPlan = p.isEmpty ? "" : p.prefix(1).uppercased() + p.dropFirst()
         let rl = d["rate_limit"] as? JSON
         var list: [Limit] = []
-        for w in ["primary_window", "secondary_window"] {
+        let windows = ["primary_window", "secondary_window"]
+        for w in windows + (rl?.keys.filter { !windows.contains($0) }.sorted() ?? []) {   // новые окна — сами
             guard let o = rl?[w] as? JSON, let used = J.double(o["used_percent"]) else { continue }
             let secs = Int64(J.double(o["limit_window_seconds"]) ?? 0)
             let at = J.double(o["reset_at"]).map { Date(timeIntervalSince1970: $0) }
@@ -747,6 +824,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         if !agyFetching && (now >= agyNextFetch || (agyExpired && now >= agyNextFetch.addingTimeInterval(-window + 20))) { fetchAgy() }
         let codexExpired = codexLimits.contains { ended($0, now) }
         if !codexFetching && (now >= codexNextFetch || (codexExpired && now >= codexNextFetch.addingTimeInterval(-window + 20))) { fetchCodex() }
+        syncProviders()
         for p in extras where !p.fetching {
             let expired = p.limits.contains { ended($0, now) }
             if now >= p.nextFetch || (expired && now >= p.nextFetch.addingTimeInterval(-window + 20)) { fetchExtra(p) }
@@ -783,7 +861,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     // столбцы как у часов в Windows: сверху сессия (5 ч), снизу неделя; у каждого точка своего цвета
     func clockCells(_ now: Date) -> [ClockCell] {
         var cells: [ClockCell] = []
-        for (key, _) in Widget.clockColumns {
+        for (key, _) in clockColumns {
             let shown: Bool
             let limits: [Limit?]
             switch key {
@@ -1017,7 +1095,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
                 if items.count <= 1 { return }   // последний столбец не снимается
                 items.removeAll { $0 == key }
             } else { items.append(key) }
-            self.s.clockItems = Widget.clockColumns.map { $0.0 }.filter { items.contains($0) }.joined(separator: ",")
+            self.s.clockItems = self.clockColumns.map { $0.0 }.filter { items.contains($0) }.joined(separator: ",")
             self.saveSettings()
             self.lastIconKey = nil
             self.updateView()
@@ -1045,7 +1123,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             }, { [unowned self] in self.fetchExtra(p) })
         }))
         // в строке меню — только столбцы тех ИИ, в которые вошли
-        menu.addItem(submenu("В строке меню", Widget.clockColumns.filter { c in !extras.contains { $0.key == c.0 && !$0.signedIn } }.map { clockToggle($0.0, $0.1) }))
+        menu.addItem(submenu("В строке меню", clockColumns.filter { c in !extras.contains { $0.key == c.0 && !$0.signedIn } }.map { clockToggle($0.0, $0.1) }))
         menu.addItem(ClosureItem("Проценты в строке меню", checked: s.clockLabel) { [unowned self] in
             self.s.clockLabel.toggle(); self.saveSettings(); self.lastIconKey = nil; self.updateView()
         })

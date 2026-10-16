@@ -74,7 +74,8 @@ struct PanelView: View {
         }
         if w.s.showAgy {
             let credits = (w.agyCredits ?? 0) > 0 ? "кредиты: \(Int(w.agyCredits!.rounded()))" : nil
-            ProviderHeader(name: "Antigravity", colors: [Pal.gemini, Pal.agyClaude], note: credits, first: !w.s.showClaude)
+            let colors = w.agyGroups.isEmpty ? [Pal.gemini, Pal.agyClaude] : w.agyGroups.map { Pal.group($0.key) }.reduce(into: [NSColor]()) { a, c in if !a.contains(c) { a.append(c) } }
+            ProviderHeader(name: "Antigravity", colors: colors, note: credits, first: !w.s.showClaude)
             if w.agyGroups.isEmpty && w.agyStatus.isEmpty { Hint("Загрузка…") }
             ForEach(w.agyGroups, id: \.key) { g in AgyRow(g: g, now: now) }
             if !w.agyStatus.isEmpty { StatusLine(w.agyStatus, w.agyStatusIsError) }
@@ -233,7 +234,10 @@ struct AgyRow: View {
                 Spacer(minLength: 0)
             }
             HStack(alignment: .top, spacing: 14) {
-                MiniBar(label: "5 часов", l: g.session, now: now, accent: color, offText: g.sessionOff ? "не действует — неделя исчерпана" : nil)
+                // у группы только недельный лимит (например, Gemini 4 Argon) — одна полоса на всю ширину
+                if g.session != nil || g.sessionOff {
+                    MiniBar(label: "5 часов", l: g.session, now: now, accent: color, offText: g.sessionOff ? "не действует — неделя исчерпана" : nil)
+                }
                 MiniBar(label: "Неделя", l: g.week, now: now, accent: color)
             }
             .padding(.top, 3)

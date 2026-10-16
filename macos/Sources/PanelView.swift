@@ -57,31 +57,27 @@ struct PanelView: View {
 
     // по разделу на сервис
     @ViewBuilder func sections(_ now: Date) -> some View {
-        if w.s.showClaude {
+        if w.claudeOn {
             ProviderHeader(name: "Claude Code", colors: [Pal.accent], note: w.plan, first: true)
-            if w.loggedOut {
-                LoginPanel(w: w)
-            } else if let sess = w.session {
+            if let sess = w.session {
                 let active = sess.resetsAt.map { $0 > now } ?? false
                 LimitRow(l: sess, now: now, note: active ? nil : "Не начата — 5-часовое окно начнётся с первого запроса", accent: Pal.accent)
             } else {
                 Hint("Загрузка…")
             }
-            if !w.loggedOut {
-                ForEach(w.weekly, id: \.key) { l in LimitRow(l: l, now: now, note: nil, accent: Pal.accent) }
-            }
+            ForEach(w.weekly, id: \.key) { l in LimitRow(l: l, now: now, note: nil, accent: Pal.accent) }
             if !w.status.isEmpty { StatusLine(w.status, w.statusIsError) }
         }
-        if w.s.showAgy {
+        if w.agyOn {
             let credits = (w.agyCredits ?? 0) > 0 ? "кредиты: \(Int(w.agyCredits!.rounded()))" : nil
             let colors = w.agyGroups.isEmpty ? [Pal.gemini, Pal.agyClaude] : w.agyGroups.map { Pal.group($0.key) }.reduce(into: [NSColor]()) { a, c in if !a.contains(c) { a.append(c) } }
-            ProviderHeader(name: "Antigravity", colors: colors, note: credits, first: !w.s.showClaude)
+            ProviderHeader(name: "Antigravity", colors: colors, note: credits, first: !w.claudeOn)
             if w.agyGroups.isEmpty && w.agyStatus.isEmpty { Hint("Загрузка…") }
             ForEach(w.agyGroups, id: \.key) { g in AgyRow(g: g, now: now) }
             if !w.agyStatus.isEmpty { StatusLine(w.agyStatus, w.agyStatusIsError) }
         }
-        if w.s.showCodex {
-            ProviderHeader(name: "Codex", colors: [Pal.codex], note: w.codexPlan, first: !w.s.showClaude && !w.s.showAgy)
+        if w.codexOn {
+            ProviderHeader(name: "Codex", colors: [Pal.codex], note: w.codexPlan, first: !w.claudeOn && !w.agyOn)
             if w.codexLimits.isEmpty && w.codexStatus.isEmpty { Hint(w.codexUpdatedAt != nil ? "Сервер не сообщил лимиты" : "Загрузка…") }
             ForEach(w.codexLimits, id: \.key) { l in LimitRow(l: l, now: now, note: nil, accent: Pal.codex) }
             if !w.codexStatus.isEmpty { StatusLine(w.codexStatus, w.codexStatusIsError) }
@@ -90,10 +86,16 @@ struct PanelView: View {
         let extras = w.shownExtras
         ForEach(extras, id: \.key) { p in
             ProviderHeader(name: p.name, colors: [p.color], note: p.plan,
-                           first: !w.s.showClaude && !w.s.showAgy && !w.s.showCodex && p === extras.first)
+                           first: !w.claudeOn && !w.agyOn && !w.codexOn && p === extras.first)
             if p.limits.isEmpty && p.status.isEmpty { Hint("Загрузка…") }
             ForEach(p.limits, id: \.key) { l in LimitRow(l: l, now: now, note: nil, accent: p.color) }
             if !p.status.isEmpty { StatusLine(p.status, p.statusIsError) }
+        }
+        // ни в один ИИ не вошли — просто пояснение, без кнопок входа
+        if w.shownServices == 0 {
+            Hint(w.anyFetching || !w.agyChecked ? "Ищем ИИ, в которые вы вошли…"
+                 : "На этом Mac нет входа ни в один ИИ.\nВойдите в Claude Code, Codex, Gemini CLI или Antigravity — лимиты появятся здесь сами.")
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -303,36 +305,6 @@ struct PanelButton: View {
     }
 }
 
-// «не вошли»: пояснение и оранжевая кнопка
-struct LoginPanel: View {
-    @ObservedObject var w: Widget
-
-    var body: some View {
-        VStack(spacing: 0) {
-            if w.loginProc != nil {
-                Text("Подтвердите вход в браузере").font(.system(size: 14, weight: .semibold)).foregroundColor(Ink.primary)
-                Text("Войдите (можно через Google) и нажмите «Authorize».\nЛимиты появятся здесь сами.")
-                    .font(.system(size: 12)).foregroundColor(Ink.secondary).multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true).padding(.top, 6).padding(.bottom, 12)
-                HStack(spacing: 8) {
-                    PanelButton(text: "Отмена", color: Color(hex: "#3A3A3C")) { w.cancelLogin() }
-                    PanelButton(text: "Открыть снова", color: Color(nsColor: Pal.accent)) { if let u = w.loginUrl { Shell.open(u) } }
-                        .opacity(w.loginUrl != nil ? 1 : 0.5)
-                }
-            } else {
-                Text("Войдите в свой аккаунт Claude,\nчтобы видеть лимиты использования.")
-                    .font(.system(size: 12.5)).foregroundColor(Ink.secondary).multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true).padding(.bottom, 12)
-                PanelButton(text: "Войти в Claude", color: Color(nsColor: Pal.accent)) { w.login() }
-                    .frame(width: 170)
-                Text("Откроется браузер — можно войти через Google.").font(.system(size: 11)).foregroundColor(Ink.tertiary).padding(.top, 8)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 14).padding(.bottom, 4)
-    }
-}
-
 struct LogoutPanel: View {
     @ObservedObject var w: Widget
 
@@ -357,7 +329,7 @@ struct LogoutPanel: View {
         var what = w.logoutTarget == "agy" ? "Откроется Терминал с Antigravity и выполнит /logout —\nпосле выхода закройте его."
                  : w.logoutTarget == "codex" ? "Вход общий с Codex — в нём тоже\nнужно будет войти заново (codex login)."
                  : "Вход общий с Claude Code — в нём тоже\nнужно будет войти заново."
-        if w.shownServices > 1 { what += "\n\nРаздел пропадёт из виджета.\nВернуть: ⋯ → Показывать." }
+        what += "\n\nРаздел пропадёт из виджета\nи вернётся сам после нового входа."
         return what
     }
 }
@@ -382,9 +354,9 @@ struct DetailsView: View {
     }
 
     @ViewBuilder var details: some View {
-        let claudeOn = w.s.showClaude && !w.loggedOut
-        let agyOn = w.s.showAgy && !w.agyMissing
-        let codexOn = w.s.showCodex && !w.codexMissing
+        let claudeOn = w.claudeOn
+        let agyOn = w.agyOn
+        let codexOn = w.codexOn
         let accounts = accountRows(claudeOn, agyOn, codexOn)
         let emails = distinctEmails(accounts.map { $0.email })
         DetailSection("Аккаунты")

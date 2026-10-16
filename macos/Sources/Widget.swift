@@ -168,7 +168,8 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     var updatedAt: Date?
     var nextFetch = Date.distantPast
     var fetching = false
-    var loggedOut = false                       // нет входа по подписке — показываем кнопку «Войти в Claude»
+    // нет входа по подписке — раздел прячем; до первой проверки входа судим по сохранённым данным и файлу входа
+    lazy var loggedOut = !FileManager.default.fileExists(atPath: cachePath) && !FileManager.default.fileExists(atPath: Widget.claudeConfigDir + "/.credentials.json")
     var notified = Set<String>()
 
     // ---------- Antigravity ----------
@@ -176,6 +177,8 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     var agyEmail: String?
     var agyStatus = ""
     var agyStatusIsError = false, agyFetching = false, agyMissing = false
+    var agyNoAuth = false                       // agy есть, но входа в нём нет — раздел прячем
+    var agyChecked = false                      // agy уже хоть раз ответил (или не нашёлся)
     var agyCredits: Double?
     var agyUpdatedAt: Date?
     var agyNextFetch = Date.distantPast
@@ -185,7 +188,9 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     var codexPlan = ""
     var codexEmail: String?
     var codexStatus = ""
-    var codexStatusIsError = false, codexFetching = false, codexMissing = false
+    var codexStatusIsError = false, codexFetching = false
+    var codexNoSub = false                      // Codex вошёл по API-ключу: лимитов подписки нет, раздел прячем
+    lazy var codexMissing = !FileManager.default.fileExists(atPath: Widget.codexAuthPath)   // нет входа в Codex — раздел прячем
     var codexUpdatedAt: Date?
     var codexNextFetch = Date.distantPast
 
@@ -202,8 +207,6 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     var lastIconKey: String?
     var confirmLogout = false, loggingOut = false
     var logoutTarget = "claude"                 // из какого сервиса выходим: claude, agy или codex
-    var loginProc: Process?
-    var loginUrl: String?
     var nextReturnCheck = Date.distantPast
     private var timers: [Timer] = []
 
@@ -214,7 +217,16 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     }
 
     var anyFetching: Bool { fetching || agyFetching || codexFetching || extras.contains { $0.fetching } }
-    var shownServices: Int { (s.showClaude ? 1 : 0) + (s.showAgy ? 1 : 0) + (s.showCodex ? 1 : 0) + shownExtras.count }
+
+    // сервис показываем, только если на этом Mac уже есть вход в него — войти виджет не просит,
+    // вошли позже (claude, codex login, agy) — раздел появится сам
+    var claudeAvail: Bool { !loggedOut }
+    var agyAvail: Bool { !agyMissing && !agyNoAuth && (!agyGroups.isEmpty || agyUpdatedAt != nil) }
+    var codexAvail: Bool { !codexMissing && !codexNoSub }
+    var claudeOn: Bool { s.showClaude && claudeAvail }
+    var agyOn: Bool { s.showAgy && agyAvail }
+    var codexOn: Bool { s.showCodex && codexAvail }
+    var shownServices: Int { (claudeOn ? 1 : 0) + (agyOn ? 1 : 0) + (codexOn ? 1 : 0) + shownExtras.count }
     func extraOn(_ key: String) -> Bool { !s.hiddenExtras.split(separator: ",").contains(Substring(key)) }
     // другие ИИ показываем, только когда в них вошли
     var shownExtras: [ExtraProvider] { extras.filter { $0.signedIn && extraOn($0.key) } }
@@ -540,10 +552,12 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     private func fetchAgyDone(_ quota: String?, _ credits: String?, _ email: String?, _ missing: Bool) {
         agyFetching = false
         agyMissing = missing
+        agyNoAuth = false
+        agyChecked = true
         if let e = email { agyEmail = e }
         var problem: String?
         if missing {
-            setAgyStatus("Antigravity CLI не найден — установите agy", true)
+            setAgyStatus("", false)
             agyNextFetch = Date().addingTimeInterval(600)
         } else if let q = quota, parseAgy(q, &problem) {
             agyUpdatedAt = Date()
@@ -555,6 +569,11 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             if let e = agyEmail { cache["Email"] = e }
             J.write(cache, agyCachePath)
             checkNotifications()
+        } else if quota != nil, problem == Widget.agyNoAuthText {
+            agyNoAuth = true
+            agyGroups = []
+            agyUpdatedAt = nil
+            setAgyStatus("", false)
         } else if quota != nil, let p = problem {
             setAgyStatus(p, agyUpdatedAt == nil)
         } else {
@@ -564,6 +583,8 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     }
 
     func setAgyStatus(_ text: String, _ error: Bool) { agyStatus = text; agyStatusIsError = error }
+
+    static let agyNoAuthText = "Нет входа в Antigravity"
 
     // «Gemini Models» → «Gemini», «Claude and GPT models» → «Claude и GPT»
     static func agyTitle(_ key: String, _ name: String?) -> String {
@@ -577,7 +598,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         guard let d = J.embedded(text) else { return false }
         if J.string(d["status"]) != "SUCCESS" {
             let r = (J.string(d["response"]) ?? J.string(d["error"]) ?? "").lowercased()
-            problem = r.contains("sign") || r.contains("auth") ? "Нет входа в Antigravity — запустите agy и войдите" : "Antigravity вернул ошибку"
+            problem = r.contains("sign") || r.contains("auth") ? Widget.agyNoAuthText : "Antigravity вернул ошибку"
             return false
         }
         guard let groups = ((d["command"] as? JSON)?["data"] as? JSON)?["groups"] as? [JSON] else {
@@ -663,7 +684,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         codexNextFetch = Date().addingTimeInterval(TimeInterval(s.refreshMinutes * 60))
         codexMissing = !FileManager.default.fileExists(atPath: Widget.codexAuthPath)
         if codexMissing {
-            setCodexStatus("Нет входа в Codex — выполните codex login", false)
+            setCodexStatus("", false)
             codexNextFetch = Date().addingTimeInterval(60)   // вход подхватится вскоре после «codex login»
             updateView()
             return
@@ -677,8 +698,10 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         let token = J.string(tokens?["access_token"]) ?? ""
         let accountId = J.string(tokens?["account_id"]) ?? ""
         if let email = J.string(Widget.jwtClaims(J.string(tokens?["id_token"]))?["email"]), !email.isEmpty { codexEmail = email }
-        if token.isEmpty {
-            setCodexStatus("Codex вошёл по API-ключу — лимитов подписки нет. Для них: codex login", false)
+        codexNoSub = token.isEmpty
+        if codexNoSub {
+            setCodexStatus("", false)
+            codexNextFetch = Date().addingTimeInterval(60)   // вход по подписке подхватится сам
             updateView()
             return
         }
@@ -791,14 +814,14 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     func checkNotifications() {
         if !s.notify { return }
         var all: [(String, Limit)] = []
-        if s.showClaude {
+        if claudeOn {
             if let l = session { all.append(("Claude Code", l)) }
             all += weekly.map { ("Claude Code", $0) }
         }
-        if s.showAgy {
+        if agyOn {
             for g in agyGroups { for l in [g.session, g.week].compactMap({ $0 }) { all.append(("Antigravity", l)) } }
         }
-        if s.showCodex { all += codexLimits.map { ("Codex", $0) } }
+        if codexOn { all += codexLimits.map { ("Codex", $0) } }
         for p in shownExtras { all += p.limits.map { (p.name, $0) } }
         let now = Date()
         for (service, l) in all {
@@ -848,7 +871,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     // подпись в шапке: когда обновлялось (по самому свежему из сервисов)
     var subText: String {
         if anyFetching { return "обновление…" }
-        let dates = [s.showClaude ? updatedAt : nil, s.showAgy ? agyUpdatedAt : nil, s.showCodex ? codexUpdatedAt : nil].compactMap { $0 }
+        let dates = [claudeOn ? updatedAt : nil, agyOn ? agyUpdatedAt : nil, codexOn ? codexUpdatedAt : nil].compactMap { $0 }
             + shownExtras.compactMap { $0.updatedAt }
         guard let last = dates.max() else { return "" }
         return "обновлено " + Fmt.date(last, Calendar.current.isDateInToday(last) ? "HH:mm" : "d MMM HH:mm")
@@ -866,10 +889,10 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             let limits: [Limit?]
             switch key {
             case "claude":
-                shown = s.showClaude
+                shown = claudeOn
                 limits = [session, weekly.first]
             case "codex":
-                shown = s.showCodex && !codexMissing
+                shown = codexOn
                 limits = [codexShort, codexLong]
             case _ where extras.contains { $0.key == key }:
                 let p = extras.first { $0.key == key }!
@@ -877,8 +900,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
                 limits = [p.short, p.long]
             default:
                 let g = agyGroups.first { $0.key == key }
-                // пока данных нет — столбец всё равно показываем («—»), чтобы надпись не прыгала
-                shown = s.showAgy && !agyMissing && (g != nil || agyGroups.isEmpty)
+                shown = agyOn && g != nil
                 limits = [g?.short, g?.week]
             }
             guard shown && clockShows(key) else { continue }
@@ -911,9 +933,9 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             return
         }
         // главное число — сессия Claude; если Claude скрыт — сессия Antigravity
-        let ag = s.showAgy ? clockGroup() : nil
+        let ag = agyOn ? clockGroup() : nil
         let agyPct = current(ag?.short, now)
-        let claudeMain = s.showClaude
+        let claudeMain = claudeOn
         let known = claudeMain ? session != nil : ag?.short != nil
         let active = session?.resetsAt.map { $0 > now } ?? false
         let main = claudeMain ? (active ? session!.percent : 0) : agyPct
@@ -929,12 +951,12 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
 
     func trayTip(_ now: Date) -> String {
         var tip: [String] = []
-        if s.showClaude, let sess = session {
+        if claudeOn, let sess = session {
             let active = sess.resetsAt.map { $0 > now } ?? false
             tip.append("Claude " + Fmt.pct(active ? sess.percent : 0) + (weekly.isEmpty ? "" : " (нед. " + Fmt.pct(current(weekly[0], now)) + ")"))
         }
-        if s.showAgy { for g in agyGroups { tip.append((g.key == "3p" ? "Claude/GPT" : g.title) + " " + Fmt.pct(current(g.short, now))) } }
-        if s.showCodex, let l = codexLimits.first { tip.append("Codex " + Fmt.pct(current(l, now))) }
+        if agyOn { for g in agyGroups { tip.append((g.key == "3p" ? "Claude/GPT" : g.title) + " " + Fmt.pct(current(g.short, now))) } }
+        if codexOn, let l = codexLimits.first { tip.append("Codex " + Fmt.pct(current(l, now))) }
         for p in shownExtras { if let l = p.short { tip.append(p.name + " " + Fmt.pct(current(l, now))) } }
         return tip.isEmpty ? "Лимиты ИИ" : "Сверху — сессия, снизу — неделя\n" + tip.joined(separator: " · ")
     }
@@ -1111,11 +1133,12 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         }
         menu.addItem(ClosureItem("Обновить") { [unowned self] in self.fetchAll() })
         menu.addItem(.separator())
+        // только те сервисы, в которые на этом Mac есть вход
         menu.addItem(submenu("Показывать", [
-            serviceToggle("Claude Code", s.showClaude, { [unowned self] v in self.s.showClaude = v; self.setLoggedOut("claude", false) }, { [unowned self] in self.fetch() }),
-            serviceToggle("Antigravity", s.showAgy, { [unowned self] v in self.s.showAgy = v; self.setLoggedOut("agy", false) }, { [unowned self] in self.fetchAgy() }),
-            serviceToggle("Codex", s.showCodex, { [unowned self] v in self.s.showCodex = v; self.setLoggedOut("codex", false) }, { [unowned self] in self.fetchCodex() })
-        ] + extras.filter { $0.signedIn }.map { p in
+            claudeAvail ? serviceToggle("Claude Code", s.showClaude, { [unowned self] v in self.s.showClaude = v; self.setLoggedOut("claude", false) }, { [unowned self] in self.fetch() }) : nil,
+            agyAvail ? serviceToggle("Antigravity", s.showAgy, { [unowned self] v in self.s.showAgy = v; self.setLoggedOut("agy", false) }, { [unowned self] in self.fetchAgy() }) : nil,
+            codexAvail ? serviceToggle("Codex", s.showCodex, { [unowned self] v in self.s.showCodex = v; self.setLoggedOut("codex", false) }, { [unowned self] in self.fetchCodex() }) : nil
+        ].compactMap { $0 } + extras.filter { $0.signedIn }.map { p in
             serviceToggle(p.name, extraOn(p.key), { [unowned self] v in
                 var list = self.s.hiddenExtras.split(separator: ",").map(String.init).filter { $0 != p.key && !$0.isEmpty }
                 if !v { list.append(p.key) }
@@ -1123,7 +1146,10 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             }, { [unowned self] in self.fetchExtra(p) })
         }))
         // в строке меню — только столбцы тех ИИ, в которые вошли
-        menu.addItem(submenu("В строке меню", clockColumns.filter { c in !extras.contains { $0.key == c.0 && !$0.signedIn } }.map { clockToggle($0.0, $0.1) }))
+        menu.addItem(submenu("В строке меню", clockColumns.filter { c in
+            if let p = extras.first(where: { $0.key == c.0 }) { return p.signedIn }
+            return c.0 == "claude" ? claudeAvail : c.0 == "codex" ? codexAvail : agyAvail
+        }.map { clockToggle($0.0, $0.1) }))
         menu.addItem(ClosureItem("Проценты в строке меню", checked: s.clockLabel) { [unowned self] in
             self.s.clockLabel.toggle(); self.saveSettings(); self.lastIconKey = nil; self.updateView()
         })
@@ -1145,58 +1171,17 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         menu.addItem(.separator())
         // выход — только из тех сервисов, где вход есть
         var outs: [NSMenuItem] = []
-        if s.showClaude && !loggedOut { outs.append(ClosureItem("Claude Code") { [unowned self] in self.logout("claude") }) }
-        if s.showAgy && !agyMissing && !agyGroups.isEmpty { outs.append(ClosureItem("Antigravity") { [unowned self] in self.logout("agy") }) }
-        if s.showCodex && !codexMissing { outs.append(ClosureItem("Codex") { [unowned self] in self.logout("codex") }) }
+        if claudeOn { outs.append(ClosureItem("Claude Code") { [unowned self] in self.logout("claude") }) }
+        if agyOn { outs.append(ClosureItem("Antigravity") { [unowned self] in self.logout("agy") }) }
+        if codexOn { outs.append(ClosureItem("Codex") { [unowned self] in self.logout("codex") }) }
         if !outs.isEmpty { menu.addItem(submenu("Выйти из аккаунта", outs)) }
-        if s.showClaude && loggedOut { menu.addItem(ClosureItem("Войти в Claude…") { [unowned self] in self.login() }) }
         menu.addItem(ClosureItem("Закрыть") { NSApp.terminate(nil) })
         return menu
     }
 
-    // ---------- вход и выход ----------
-    // Вход у виджета общий с Claude Code, поэтому входим и выходим его же командами:
-    // «claude auth login» открывает браузер, «claude auth logout» удаляет вход из связки ключей.
-    func login() {
-        if loginProc != nil {
-            if let u = loginUrl { Shell.open(u) }   // вход уже идёт — просто открыть страницу снова
-            return
-        }
-        loginUrl = nil
-        if let exe = Widget.claudeExe {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: exe)
-            p.arguments = ["auth", "login", "--claudeai"]
-            p.environment = Shell.environment
-            let out = Pipe()
-            p.standardOutput = out
-            p.standardError = out
-            p.standardInput = Pipe()
-            out.fileHandleForReading.readabilityHandler = { [weak self] h in
-                let d = h.availableData
-                if d.isEmpty { h.readabilityHandler = nil; return }
-                guard let text = String(data: d, encoding: .utf8), let r = text.range(of: "https://\\S+", options: .regularExpression) else { return }
-                let url = String(text[r])
-                DispatchQueue.main.async { if self?.loginUrl == nil { self?.loginUrl = url; self?.updateView() } }
-            }
-            p.terminationHandler = { [weak self] _ in
-                DispatchQueue.main.async { self?.loginProc = nil; self?.loginUrl = nil; self?.fetch() }
-            }
-            do { try p.run(); loginProc = p } catch { setStatus("Не удалось запустить Claude Code", true) }
-        } else {
-            setStatus("Claude Code не найден — установите его и выполните claude", true)
-        }
-        if !popover.isShown || preview { showWidget() }
-        updateView()
-    }
-
-    func cancelLogin() {
-        if let p = loginProc, p.isRunning { p.terminate() }
-        loginProc = nil
-        loginUrl = nil
-        updateView()
-    }
-
+    // ---------- выход ----------
+    // Сам виджет войти не просит — берёт вход, который уже есть у Claude Code, Codex, Antigravity и других ИИ.
+    // Выходим их же командами: «claude auth logout» удаляет вход из связки ключей.
     static func serviceName(_ target: String) -> String { target == "agy" ? "Antigravity" : target == "codex" ? "Codex" : "Claude Code" }
 
     // подтверждение показываем в самой панели
@@ -1223,21 +1208,20 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         }
     }
 
-    // после выхода сведения о сервисе больше не показываем
-    // (если это был единственный сервис — раздел остаётся, в нём предложение войти)
+    // после выхода сведения о сервисе больше не показываем: раздел, столбец и подробности прячутся,
+    // а после нового входа возвращаются сами
     func afterLogout(_ target: String) {
-        let hide = shownServices > 1
         switch target {
         case "claude":
             clearData()
-            if hide { s.showClaude = false; setLoggedOut("claude", true) }
+            s.showClaude = false; setLoggedOut("claude", true)
         case "agy":
             agyGroups = []
             agyEmail = nil
             agyCredits = nil
             agyUpdatedAt = nil
             try? FileManager.default.removeItem(atPath: agyCachePath)
-            if hide { s.showAgy = false; setLoggedOut("agy", true) } else { setAgyStatus("Нет входа в Antigravity — запустите agy и войдите", false) }
+            s.showAgy = false; setLoggedOut("agy", true)
             // окно agy с /logout ещё открыто — первую пробу делаем через обычный интервал
             agyNextFetch = Date().addingTimeInterval(TimeInterval(s.refreshMinutes * 60))
         default:
@@ -1246,7 +1230,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             codexPlan = ""
             codexUpdatedAt = nil
             try? FileManager.default.removeItem(atPath: codexCachePath)
-            if hide { s.showCodex = false; setLoggedOut("codex", true) }
+            s.showCodex = false; setLoggedOut("codex", true)
         }
         saveSettings()
         lastIconKey = nil

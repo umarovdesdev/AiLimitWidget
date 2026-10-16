@@ -2131,7 +2131,8 @@ namespace AiLimitWidget
           </LinearGradientBrush>
         </Border.Background>
       </Border>
-      <StackPanel x:Name='Body' Margin='14,12,12,14'>
+      <Grid x:Name='Body' Margin='14,12,12,14'>
+        <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='*'/></Grid.RowDefinitions>
         <Grid x:Name='Header'>
           <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
           <Grid Width='24' Height='24' VerticalAlignment='Center'>
@@ -2161,10 +2162,37 @@ namespace AiLimitWidget
             </Border>
           </StackPanel>
         </Grid>
-        <StackPanel x:Name='Rows' Margin='0,4,0,0'/>
-        <TextBlock x:Name='StatusText' FontSize='12' TextWrapping='Wrap' Margin='0,8,0,0' Visibility='Collapsed'/>
-        <StackPanel x:Name='Details' Visibility='Collapsed'/>
-      </StackPanel>
+        <!-- много ИИ — список прокручивается, шапка остаётся на месте, окно не выходит за экран -->
+        <ScrollViewer x:Name='Scroll' Grid.Row='1' VerticalScrollBarVisibility='Auto' HorizontalScrollBarVisibility='Disabled' Focusable='False' PanningMode='VerticalOnly'>
+          <ScrollViewer.Resources>
+            <Style TargetType='ScrollBar'>
+              <Setter Property='Width' Value='5'/>
+              <Setter Property='MinWidth' Value='5'/>
+              <Setter Property='Margin' Value='5,6,-7,0'/>
+              <Setter Property='Template'>
+                <Setter.Value>
+                  <ControlTemplate TargetType='ScrollBar'>
+                    <Track x:Name='PART_Track' IsDirectionReversed='True'>
+                      <Track.Thumb>
+                        <Thumb>
+                          <Thumb.Template>
+                            <ControlTemplate TargetType='Thumb'><Border CornerRadius='2.5' Background='#59FFFFFF'/></ControlTemplate>
+                          </Thumb.Template>
+                        </Thumb>
+                      </Track.Thumb>
+                    </Track>
+                  </ControlTemplate>
+                </Setter.Value>
+              </Setter>
+            </Style>
+          </ScrollViewer.Resources>
+          <StackPanel>
+            <StackPanel x:Name='Rows' Margin='0,4,0,0'/>
+            <TextBlock x:Name='StatusText' FontSize='12' TextWrapping='Wrap' Margin='0,8,0,0' Visibility='Collapsed'/>
+            <StackPanel x:Name='Details' Visibility='Collapsed'/>
+          </StackPanel>
+        </ScrollViewer>
+      </Grid>
     </Grid>
   </Border>
 </Window>";
@@ -2376,7 +2404,7 @@ namespace AiLimitWidget
             // открыто наведением — только полосы лимитов и время сброса, без шапки и подробностей
             Find<Grid>("Header").Visibility = preview ? Visibility.Collapsed : Visibility.Visible;
             Find<Border>("Shine").Visibility = preview ? Visibility.Collapsed : Visibility.Visible;
-            Find<StackPanel>("Body").Margin = preview ? new Thickness(14, 2, 12, 12) : new Thickness(14, 12, 12, 14);
+            Find<Grid>("Body").Margin = preview ? new Thickness(14, 2, 12, 12) : new Thickness(14, 12, 12, 14);
             var details = Find<StackPanel>("Details");
             details.Visibility = preview ? Visibility.Collapsed : Visibility.Visible;
             if (window.IsVisible && !preview && !confirmLogout && !loggingOut) BuildDetails(details, now);
@@ -2676,6 +2704,10 @@ namespace AiLimitWidget
                 int widthPx = window.ActualWidth > 0 ? (int)Math.Round(window.ActualWidth * scale) : r.Right - r.Left;
                 int heightPx = window.ActualHeight > 0 ? (int)Math.Round(window.ActualHeight * scale) : r.Bottom - r.Top;
                 int margin = (int)(DockMargin * scale);
+                // окно не выше рабочей области экрана — лишнее уходит в прокрутку
+                double maxHeight = Math.Max(120, (work.Height - 2 * margin) / scale);
+                if (Math.Abs(window.MaxHeight - maxHeight) > 0.5) { window.MaxHeight = maxHeight; window.UpdateLayout(); }
+                heightPx = Math.Min(heightPx, (int)Math.Round(maxHeight * scale));
                 int x = work.Right - widthPx - margin;
                 int y = work.Bottom - heightPx - margin;
                 SetWindowPos(hwnd, IntPtr.Zero, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);

@@ -38,6 +38,28 @@
 | GitHub Copilot | Copilot CLI (связка ключей `copilot-cli` или `~/.copilot`), плагин Copilot (`~/.config/github-copilot`) или `gh auth token`; месячные лимиты | Copilot CLI (диспетчер учётных данных или `%USERPROFILE%\.copilot`), плагин Copilot (`%LOCALAPPDATA%\github-copilot`) или `gh auth token` |
 | Cursor | `~/Library/Application Support/Cursor/…/state.vscdb`; расход за месяц подписки | `%APPDATA%\Cursor\User\globalStorage\state.vscdb` (читается без sqlite3) |
 
+Новые лимиты внутри этих сервисов (группы Antigravity вроде Gemini 4 Argon, лимиты Claude, Codex, Copilot) появляются сами (Windows).
+
+### Свой ИИ без пересборки (Windows)
+
+Любой ИИ добавляется одним файлом: положите `<имя>.json` в `%APPDATA%\AiLimitWidget\providers\` —
+через несколько секунд он сам появится в окне, в «Показывать» и столбцом у часов, со своим цветом.
+
+```json
+{ "name": "Grok", "color": "#FF6482", "command": "python", "args": "C:\\scripts\\grok.py", "timeout": 30 }
+```
+
+`color` можно не указывать — цвет подберётся сам. Команда печатает JSON (в UTF-8 или с `\uXXXX`-экранированием):
+
+```json
+{ "signed_in": true, "plan": "Pro", "email": "me@example.com", "problem": null,
+  "limits": [ { "title": "Сессия (5 ч)", "percent": 42, "resets_at": "2026-10-16T15:00:00Z", "window_seconds": 18000 },
+              { "title": "Неделя", "remaining": 70, "resets_at": "2026-10-20T10:00:00Z", "window_seconds": 604800 } ] }
+```
+
+`percent` — сколько израсходовано, `remaining` — сколько осталось (0…100); `"signed_in": false` — раздел прячется.
+У часов сверху — лимит с самым коротким окном, снизу — с самым длинным.
+
 Выход из Antigravity на Mac открывает Терминал с `agy -i /logout` (macOS может спросить разрешение управлять Терминалом).
 
 Настройки хранятся в `~/Library/Application Support/AiLimitWidget/` (macOS) и `%APPDATA%\AiLimitWidget\` (Windows).

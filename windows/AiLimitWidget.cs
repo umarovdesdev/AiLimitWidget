@@ -38,6 +38,7 @@ namespace AiLimitWidget
         public bool ShowDetails;                                   // развёрнуты ли подробности (аккаунт, на что ушла неделя)
         public string ClockItems = "claude,gemini,3p,codex,geminicli,copilot,cursor";   // что показывать у часов: claude, gemini (Antigravity), 3p (Claude и GPT в Antigravity), codex, другие ИИ
         public int ClockVersion;                                   // 2 — в ClockItems уже учтён столбец codex, 3 — столбцы других ИИ
+        public string SeenExtras = "";                             // ИИ из папки providers, которые уже встречались: новый сам получает столбец у часов
         public string AgyKeys = "gemini,3p";                       // группы Antigravity, которые уже встречались: новая (например, Gemini 4 Argon) сама получает столбец у часов
         public string HiddenExtras = "";                           // другие ИИ (Gemini CLI, Copilot, Cursor), которые выключили в «Показывать»
         public string LoggedOut = "";                              // сервисы, скрытые из-за выхода: вернутся сами, когда в них снова войдут
@@ -203,11 +204,85 @@ namespace AiLimitWidget
     // Входы только читаем: обновлённый токен Gemini держим в памяти и в файл не пишем. Всё вызывается из фонового потока.
     static class Extra
     {
-        public static readonly string[][] All = {
+        // встроенные ИИ; к ним добавляются описания из папки providers (ScanProviders) — без пересборки виджета
+        public static readonly List<string[]> All = new List<string[]> {
             new[] { "geminicli", "Gemini CLI", "#8AB4F8" },   // голубой
             new[] { "copilot", "GitHub Copilot", "#BF5AF2" }, // фиолетовый
             new[] { "cursor", "Cursor", "#40C8E0" }           // бирюзовый
         };
+
+        // ---------- ИИ из папки providers ----------
+        // %APPDATA%\AiLimitWidget\providers\<имя>.json: { "name": "Grok", "color": "#RRGGBB" (можно не указывать),
+        //   "command": "python", "args": "C:\\…\\grok.py", "timeout": 30 }
+        // Команда печатает JSON: { "signed_in": true, "plan": "Pro", "email": "…", "problem": null,
+        //   "limits": [ { "title": "Неделя", "percent": 12.5, "resets_at": "2026-10-20T10:00:00Z", "window_seconds": 604800 } ] }
+        // percent — сколько израсходовано (0…100); вместо него можно remaining — сколько осталось (0…100).
+        // Новый файл подхватывается на ходу: ИИ сам появляется в окне, в «Показывать» и у часов.
+        static readonly Dictionary<string, Dictionary<string, object>> providers = new Dictionary<string, Dictionary<string, object>>();
+        static readonly string[] AutoColors = { "#FF6482", "#66D4CF", "#A8E05F", "#AC8E68", "#DA8FFF", "#FFB8A0" };
+
+        public static string ProvidersDir
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AiLimitWidget", "providers"); }
+        }
+
+        // вызывается из окна (основной поток): возвращает только что найденные ИИ
+        public static List<string[]> ScanProviders()
+        {
+            var found = new List<string[]>();
+            try
+            {
+                if (!Directory.Exists(ProvidersDir)) Directory.CreateDirectory(ProvidersDir);
+                foreach (string f in Directory.GetFiles(ProvidersDir, "*.json").OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                {
+                    var d = File(f);
+                    string name = Str(Get(d, "name"));
+                    if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(Str(Get(d, "command")))) continue;
+                    string key = "p-" + Path.GetFileNameWithoutExtension(f).ToLowerInvariant().Replace(",", "-").Replace(" ", "-");
+                    lock (providers) providers[key] = d;   // изменённый файл действует со следующего обновления
+                    if (All.Any(x => x[0] == key)) continue;
+                    string color = Str(Get(d, "color"));
+                    if (color == null || !System.Text.RegularExpressions.Regex.IsMatch(color, "^#[0-9A-Fa-f]{6}$"))
+                        color = AutoColors.FirstOrDefault(c => All.All(x => !string.Equals(x[2], c, StringComparison.OrdinalIgnoreCase)))
+                                ?? AutoColors[found.Count % AutoColors.Length];
+                    var entry = new[] { key, name, color };
+                    All.Add(entry);
+                    found.Add(entry);
+                }
+            }
+            catch (Exception) { }
+            return found;
+        }
+
+        static ExtraResult Provider(string key, Dictionary<string, object> def)
+        {
+            string name = Str(Get(def, "name")) ?? key;
+            string text;
+            try
+            {
+                double timeout = Num(Get(def, "timeout")) ?? 30;
+                text = Background.Run(Str(Get(def, "command")), Str(Get(def, "args")) ?? "", Home, (int)(Math.Max(5, Math.Min(300, timeout)) * 1000));
+            }
+            catch (Exception) { return new ExtraResult { Problem = name + ": команда не запускается — проверьте command в " + key.Substring(2) + ".json" }; }
+            var d = Parse(text == null ? null : text.Trim());
+            if (d == null) return new ExtraResult { Problem = name + " не ответил или ответ не JSON" };
+            if (Bool(Get(d, "signed_in")) == false) return new ExtraResult { SignedIn = false };
+            var r = new ExtraResult { Plan = Str(Get(d, "plan")) ?? "", Email = Str(Get(d, "email")), Problem = Str(Get(d, "problem")) };
+            var limits = Get(d, "limits") as System.Collections.IEnumerable;
+            var list = new List<Limit>();
+            if (limits != null)
+                foreach (var l in limits.OfType<Dictionary<string, object>>())
+                {
+                    double? used = Num(Get(l, "percent")), left = Num(Get(l, "remaining"));
+                    if (!used.HasValue && left.HasValue) used = 100 - left.Value;
+                    if (!used.HasValue) continue;
+                    list.Add(new Limit { Key = key + "-" + list.Count, Title = Str(Get(l, "title")) ?? "Лимит", Percent = Clamp(used.Value),
+                                         ResetsAt = Time(Get(l, "resets_at")), WindowSeconds = (long)(Num(Get(l, "window_seconds")) ?? 0) });
+                }
+            r.Limits.AddRange(list.OrderBy(l => l.WindowSeconds));   // у часов сверху — самое короткое окно, снизу — самое длинное
+            if (r.Limits.Count == 0 && r.Problem == null) r.Problem = "Сервер не сообщил лимиты";
+            return r;
+        }
 
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
         static string Home { get { return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile); } }
@@ -219,7 +294,10 @@ namespace AiLimitWidget
                 case "geminicli": return Gemini();
                 case "copilot": return Copilot();
                 case "cursor": return Cursor();
-                default: return new ExtraResult { SignedIn = false };
+                default:
+                    Dictionary<string, object> def;
+                    lock (providers) providers.TryGetValue(key, out def);
+                    return def != null ? Provider(key, def) : new ExtraResult { SignedIn = false };
             }
         }
 
@@ -582,7 +660,8 @@ namespace AiLimitWidget
             var totalQuotas = Obj(d, "monthly_quotas");
             if (snaps != null)
             {
-                foreach (string key in new[] { "premium_interactions", "chat", "completions" })
+                // известные — в привычном порядке, новые — после них, с названием из ключа
+                foreach (string key in names.Keys.Concat(snaps.Keys.Where(k => !names.ContainsKey(k))))
                 {
                     var s = Obj(snaps, key);
                     if (s == null || Bool(Get(s, "unlimited")) == true) continue;
@@ -593,21 +672,27 @@ namespace AiLimitWidget
                         if (e.HasValue && e.Value > 0 && rem.HasValue) left = rem.Value / e.Value * 100;
                     }
                     if (!left.HasValue) continue;
-                    r.Limits.Add(new Limit { Key = "copilot-" + key, Title = names[key], Percent = Clamp(100 - left.Value), ResetsAt = resetAt, WindowSeconds = month });
+                    r.Limits.Add(new Limit { Key = "copilot-" + key, Title = CopilotTitle(names, key), Percent = Clamp(100 - left.Value), ResetsAt = resetAt, WindowSeconds = month });
                 }
             }
             else if (leftQuotas != null && totalQuotas != null)
             {
                 // бесплатный Copilot: сколько осталось из месячной нормы
-                foreach (string key in new[] { "chat", "completions" })
+                foreach (string key in totalQuotas.Keys)
                 {
                     double? t = Num(Get(totalQuotas, key)), rem = Num(Get(leftQuotas, key));
                     if (!t.HasValue || t.Value <= 0 || !rem.HasValue) continue;
-                    r.Limits.Add(new Limit { Key = "copilot-" + key, Title = names[key], Percent = Clamp((t.Value - rem.Value) / t.Value * 100), ResetsAt = resetAt, WindowSeconds = month });
+                    r.Limits.Add(new Limit { Key = "copilot-" + key, Title = CopilotTitle(names, key), Percent = Clamp((t.Value - rem.Value) / t.Value * 100), ResetsAt = resetAt, WindowSeconds = month });
                 }
             }
             if (r.Limits.Count == 0) r.Problem = "Без ограничений по тарифу";
             return r;
+        }
+
+        static string CopilotTitle(Dictionary<string, string> names, string key)
+        {
+            string title;
+            return names.TryGetValue(key, out title) ? title : Capital(key.Replace('_', ' ')) + " · месяц";
         }
 
         // ---------- Cursor ----------
@@ -1242,6 +1327,7 @@ namespace AiLimitWidget
                 if ((v = Get(d, "ClockItems")) != null) settings.ClockItems = Convert.ToString(v, Inv);
                 if ((v = Get(d, "HiddenExtras")) != null) settings.HiddenExtras = Convert.ToString(v, Inv);
                 if ((v = Get(d, "AgyKeys")) != null) settings.AgyKeys = Convert.ToString(v, Inv);
+                if ((v = Get(d, "SeenExtras")) != null) settings.SeenExtras = Convert.ToString(v, Inv);
             }
             catch (Exception) { }
             if (!Positions.Contains(settings.Position)) settings.Position = "TR";
@@ -1271,7 +1357,7 @@ namespace AiLimitWidget
                     { "Left", settings.Left }, { "Top", settings.Top }, { "KeepOpen", settings.KeepOpen }, { "Notify", settings.Notify }, { "ClockLabel", settings.ClockLabel },
                     { "ShowClaude", settings.ShowClaude }, { "ShowAgy", settings.ShowAgy }, { "ShowCodex", settings.ShowCodex },
                     { "ClockItems", settings.ClockItems }, { "ClockVersion", settings.ClockVersion }, { "LoggedOut", settings.LoggedOut }, { "ShowDetails", settings.ShowDetails },
-                    { "HiddenExtras", settings.HiddenExtras }, { "AgyKeys", settings.AgyKeys } };
+                    { "HiddenExtras", settings.HiddenExtras }, { "AgyKeys", settings.AgyKeys }, { "SeenExtras", settings.SeenExtras } };
                 File.WriteAllText(settingsPath, json.Serialize(d), new UTF8Encoding(false));
             }
             catch (Exception) { }
@@ -1341,6 +1427,7 @@ namespace AiLimitWidget
             Fetch();
             FetchAgy();
             FetchCodex();
+            SyncProviders();
             foreach (var x in extras) FetchExtra(x);
             CheckReturn(true);   // заодно — не вошли ли снова в скрытые после выхода сервисы
         }
@@ -1801,7 +1888,8 @@ namespace AiLimitWidget
                 codexPlan = string.IsNullOrEmpty(plan) ? "" : char.ToUpper(plan[0], Inv) + plan.Substring(1);
                 var rl = Get(d, "rate_limit") as Dictionary<string, object>;
                 var list = new List<Limit>();
-                foreach (string w in new[] { "primary_window", "secondary_window" })
+                var windows = new[] { "primary_window", "secondary_window" };
+                foreach (string w in rl == null ? windows : windows.Concat(rl.Keys.Where(k => !windows.Contains(k))))   // новые окна — сами
                 {
                     var o = Get(rl, w) as Dictionary<string, object>;
                     if (o == null || Get(o, "used_percent") == null) continue;
@@ -1840,6 +1928,25 @@ namespace AiLimitWidget
         readonly List<ExtraProvider> extras = Extra.All.Select(x => new ExtraProvider { Key = x[0], Name = x[1], Color = C(x[2]) }).ToList();
 
         ExtraProvider ExtraFor(string key) { return extras.FirstOrDefault(x => x.Key == key); }
+
+        // новые файлы в папке providers: ИИ появляется в окне и в меню, а у часов — один раз включается его столбец
+        DateTime providersScan = DateTime.MinValue;
+
+        void SyncProviders()
+        {
+            if (DateTime.Now < providersScan) return;   // папку смотрим не чаще раза в 10 с
+            providersScan = DateTime.Now.AddSeconds(10);
+            var found = Extra.ScanProviders();
+            if (found.Count == 0) return;
+            foreach (var e in found) extras.Add(new ExtraProvider { Key = e[0], Name = e[1], Color = C(e[2]) });
+            var seen = settings.SeenExtras.Split(',').Where(k => k.Length > 0).ToList();
+            var fresh = found.Select(e => e[0]).Where(k => !seen.Contains(k)).ToList();
+            if (fresh.Count == 0) return;
+            settings.SeenExtras = string.Join(",", seen.Concat(fresh));
+            var items = settings.ClockItems.Split(',').Where(x => x.Length > 0).Concat(fresh).ToList();
+            settings.ClockItems = string.Join(",", ClockColumns.Select(c => c[0]).Where(items.Contains));
+            SaveSettings();
+        }
         bool ExtraOn(string key) { return !settings.HiddenExtras.Split(',').Contains(key); }
         List<ExtraProvider> ShownExtras { get { return extras.Where(x => x.SignedIn && ExtraOn(x.Key)).ToList(); } }
 
@@ -2131,7 +2238,8 @@ namespace AiLimitWidget
             bool codexExpired = codexLimits.Any(l => l.ResetsAt.HasValue && l.ResetsAt.Value <= DateTime.Now && l.Percent > 0);
             if (!codexFetching && (DateTime.Now >= codexNextFetch || (codexExpired && DateTime.Now >= codexNextFetch.AddMinutes(-settings.RefreshMinutes).AddSeconds(20))))
                 FetchCodex();
-            foreach (var x in extras.Where(e => !e.Fetching))
+            SyncProviders();
+            foreach (var x in extras.Where(e => !e.Fetching).ToList())
             {
                 bool extraExpired = x.Limits.Any(l => l.ResetsAt.HasValue && l.ResetsAt.Value <= DateTime.Now && l.Percent > 0);
                 if (DateTime.Now >= x.NextFetch || (extraExpired && DateTime.Now >= x.NextFetch.AddMinutes(-settings.RefreshMinutes).AddSeconds(20)))

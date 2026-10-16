@@ -25,6 +25,15 @@ using Microsoft.Win32;
 using WinForms = System.Windows.Forms;
 using Gdi = System.Drawing;
 
+// сведения о файле (Свойства → Подробно): без них Windows считает exe совсем «безымянным»
+[assembly: System.Reflection.AssemblyTitle("Лимиты ИИ")]
+[assembly: System.Reflection.AssemblyDescription("Лимиты Claude Code, Codex, Antigravity и других ИИ у часов на панели задач")]
+[assembly: System.Reflection.AssemblyProduct("AiLimitWidget")]
+[assembly: System.Reflection.AssemblyCompany("umarovdesdev")]
+[assembly: System.Reflection.AssemblyCopyright("© 2026 umarovdesdev")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+
 namespace AiLimitWidget
 {
     sealed class Settings
@@ -967,6 +976,8 @@ namespace AiLimitWidget
         readonly List<AgyGroup> agyGroups = new List<AgyGroup>();
         string agyEmail, agyStatus = "";
         bool agyStatusIsError, agyFetching, agyMissing;
+        bool agyNoAuth;   // agy есть, но входа в нём нет — раздел прячем
+        bool agyChecked;  // agy уже хоть раз ответил (или не нашёлся)
         double? agyCredits;
         DateTime? agyUpdatedAt;
         DateTime agyNextFetch = DateTime.MinValue;
@@ -985,7 +996,16 @@ namespace AiLimitWidget
         DateTime? updatedAt;
         DateTime nextFetch = DateTime.MinValue;
         bool fetching;
-        bool loggedOut;   // в Claude Code нет входа по подписке — показываем кнопку «Войти в Claude»
+        bool loggedOut = !File.Exists(CredentialsPath);   // в Claude Code нет входа по подписке — раздел прячем
+
+        // сервис показываем, только если на компьютере уже есть вход в него — войти виджет не просит,
+        // вошли позже (claude, codex login, agy) — раздел появится сам
+        bool ClaudeAvail { get { return !loggedOut; } }
+        bool AgyAvail { get { return !agyMissing && !agyNoAuth && (agyGroups.Count > 0 || agyUpdatedAt.HasValue); } }
+        bool CodexAvail { get { return !codexMissing && !codexNoSub; } }
+        bool ClaudeOn { get { return settings.ShowClaude && ClaudeAvail; } }
+        bool AgyOn { get { return settings.ShowAgy && AgyAvail; } }
+        bool CodexOn { get { return settings.ShowCodex && CodexAvail; } }
         readonly HashSet<string> notified = new HashSet<string>();
 
         Window window;
@@ -1170,13 +1190,13 @@ namespace AiLimitWidget
                 string key = cols[p][0];
                 if (key == "claude")
                 {
-                    shown[p] = settings.ShowClaude;
+                    shown[p] = ClaudeOn;
                     limits[0, p] = session;
                     limits[1, p] = week;
                 }
                 else if (key == "codex")
                 {
-                    shown[p] = settings.ShowCodex && !codexMissing;
+                    shown[p] = CodexOn;
                     limits[0, p] = CodexShort;
                     limits[1, p] = CodexLong;
                 }
@@ -1190,14 +1210,13 @@ namespace AiLimitWidget
                 else
                 {
                     AgyGroup g = agyGroups.FirstOrDefault(x => x.Key == key);
-                    // пока данных нет — столбец всё равно показываем («—»), чтобы надпись не прыгала
-                    shown[p] = settings.ShowAgy && !agyMissing && (g != null || agyGroups.Count == 0);
+                    shown[p] = AgyOn && g != null;
                     limits[0, p] = g == null ? null : g.Short;
                     limits[1, p] = g == null ? null : g.Week;
                 }
                 shown[p] = shown[p] && ClockShows(key);
             }
-            if (!shown.Any(x => x)) shown[0] = true;
+            if (!shown.Any(x => x)) { if (clock.IsVisible) clock.Hide(); return; }   // ни в один ИИ не вошли — надписи у часов нет
             // меняем текст и цвет только когда они действительно изменились — иначе надпись перерисовывается каждую секунду
             for (int i = 0; i < 2; i++)
             {
@@ -1623,9 +1642,11 @@ namespace AiLimitWidget
             agyFetching = false;
             UpdateSpin();
             agyMissing = missing;
+            agyNoAuth = false;
+            agyChecked = true;
             if (email != null) agyEmail = email;
             string problem = null;
-            if (missing) { SetAgyStatus("Antigravity CLI не найден — установите agy", true); agyNextFetch = DateTime.Now.AddMinutes(10); }
+            if (missing) { SetAgyStatus("", false); agyNextFetch = DateTime.Now.AddMinutes(10); }
             else if (quota != null && ParseAgy(quota, out problem))
             {
                 agyUpdatedAt = DateTime.Now;
@@ -1640,12 +1661,15 @@ namespace AiLimitWidget
                 catch (Exception) { }
                 CheckNotifications();
             }
+            else if (quota != null && problem == AgyNoAuthText) { agyNoAuth = true; agyGroups.Clear(); agyUpdatedAt = null; SetAgyStatus("", false); }
             else if (quota != null && problem != null) SetAgyStatus(problem, agyUpdatedAt == null);
             else SetAgyStatus("Antigravity не ответил — повторю позже", agyUpdatedAt == null);
             UpdateView();
         }
 
         void SetAgyStatus(string text, bool error) { agyStatus = text; agyStatusIsError = error; }
+
+        const string AgyNoAuthText = "Нет входа в Antigravity";
 
         // «Gemini Models» → «Gemini», «Claude and GPT models» → «Claude и GPT»
         static string AgyTitle(string key, string name)
@@ -1666,7 +1690,7 @@ namespace AiLimitWidget
                 {
                     string r = Convert.ToString(Get(d, "response") ?? Get(d, "error"), Inv) ?? "";
                     problem = r.IndexOf("sign", StringComparison.OrdinalIgnoreCase) >= 0 || r.IndexOf("auth", StringComparison.OrdinalIgnoreCase) >= 0
-                        ? "Нет входа в Antigravity — запустите agy и войдите" : "Antigravity вернул ошибку";
+                        ? AgyNoAuthText : "Antigravity вернул ошибку";
                     return false;
                 }
                 var data = Get(Get(d, "command") as Dictionary<string, object>, "data") as Dictionary<string, object>;
@@ -1764,7 +1788,8 @@ namespace AiLimitWidget
         readonly string codexCachePath;
         readonly List<Limit> codexLimits = new List<Limit>();
         string codexPlan = "", codexEmail, codexStatus = "";
-        bool codexStatusIsError, codexFetching, codexMissing;
+        bool codexStatusIsError, codexFetching, codexNoSub;   // codexNoSub — Codex вошёл по API-ключу: лимитов подписки нет, раздел прячем
+        bool codexMissing = !File.Exists(CodexAuthPath);   // нет входа в Codex — раздел прячем
         DateTime? codexUpdatedAt;
         DateTime codexNextFetch = DateTime.MinValue;
 
@@ -1802,7 +1827,7 @@ namespace AiLimitWidget
                 codexMissing = !File.Exists(CodexAuthPath);
                 if (codexMissing)
                 {
-                    SetCodexStatus("Нет входа в Codex — выполните codex login", false);
+                    SetCodexStatus("", false);
                     codexNextFetch = DateTime.Now.AddMinutes(1);   // вход подхватится вскоре после «codex login»
                     UpdateView();
                     return;
@@ -1815,9 +1840,11 @@ namespace AiLimitWidget
                 if (!string.IsNullOrEmpty(email)) codexEmail = email;
             }
             catch (Exception) { SetCodexStatus("Не удалось прочитать вход Codex", codexUpdatedAt == null); UpdateView(); return; }
-            if (string.IsNullOrEmpty(token))
+            codexNoSub = string.IsNullOrEmpty(token);
+            if (codexNoSub)
             {
-                SetCodexStatus("Codex вошёл по API-ключу — лимитов подписки нет. Для них: codex login", false);
+                SetCodexStatus("", false);
+                codexNextFetch = DateTime.Now.AddMinutes(1);   // вход по подписке подхватится сам
                 UpdateView();
                 return;
             }
@@ -2294,20 +2321,17 @@ namespace AiLimitWidget
                 rows.Children.Add(LogoutPanel());
             else
             {
-                if (settings.ShowClaude)
+                if (ClaudeOn)
                 {
                     rows.Children.Add(ProviderHeader("Claude Code", new[] { Accent }, plan, rows.Children.Count == 0));
-                    if (loggedOut)
-                        rows.Children.Add(LoginPanel());
-                    else if (session == null)
+                    if (session == null)
                         rows.Children.Add(Hint("Загрузка…"));
                     else
                         rows.Children.Add(Row(session, now, active ? null : "Не начата — 5-часовое окно начнётся с первого запроса", Accent));
-                    if (!loggedOut)
-                        foreach (var l in weekly) rows.Children.Add(Row(l, now, null, Accent));
+                    foreach (var l in weekly) rows.Children.Add(Row(l, now, null, Accent));
                     if (!string.IsNullOrEmpty(status)) rows.Children.Add(StatusLine(status, statusIsError));
                 }
-                if (settings.ShowAgy)
+                if (AgyOn)
                 {
                     string credits = agyCredits.HasValue && agyCredits.Value > 0 ? "кредиты: " + Math.Round(agyCredits.Value) : null;
                     var agyColors = agyGroups.Count > 0 ? agyGroups.Select(g => GroupColor(g.Key)).Distinct().ToArray() : new[] { GeminiColor, AgyClaudeColor };
@@ -2317,7 +2341,7 @@ namespace AiLimitWidget
                     foreach (var g in agyGroups) rows.Children.Add(AgyRow(g, now));
                     if (!string.IsNullOrEmpty(agyStatus)) rows.Children.Add(StatusLine(agyStatus, agyStatusIsError));
                 }
-                if (settings.ShowCodex)
+                if (CodexOn)
                 {
                     rows.Children.Add(ProviderHeader("Codex", new[] { CodexColor }, codexPlan, rows.Children.Count == 0));
                     if (codexLimits.Count == 0 && string.IsNullOrEmpty(codexStatus))
@@ -2333,6 +2357,10 @@ namespace AiLimitWidget
                     foreach (var l in x.Limits) rows.Children.Add(Row(l, now, null, x.Color));
                     if (!string.IsNullOrEmpty(x.Status)) rows.Children.Add(StatusLine(x.Status, x.StatusIsError));
                 }
+                // ни в один ИИ не вошли — просто пояснение, без кнопок входа
+                if (rows.Children.Count == 0)
+                    rows.Children.Add(Hint(AnyFetching || !agyChecked ? "Ищем ИИ, в которые вы вошли…"
+                        : "На этом компьютере нет входа ни в один ИИ.\nВойдите в Claude Code, Codex, Gemini CLI или Antigravity — лимиты появятся здесь сами."));
             }
 
             // подпись: когда обновлялось (по самому свежему из сервисов)
@@ -2513,43 +2541,6 @@ namespace AiLimitWidget
             return panel;
         }
 
-        // экран «не вошли»: как в Claude Usage Widget — пояснение и оранжевая кнопка
-        UIElement LoginPanel()
-        {
-            var panel = new StackPanel { Margin = new Thickness(0, 14, 0, 4) };
-            if (loginProc != null)
-            {
-                panel.Children.Add(new TextBlock { Text = "Подтвердите вход в браузере", FontSize = 14, FontWeight = FontWeights.SemiBold,
-                                                   Foreground = B("#F5F5F7"), TextAlignment = TextAlignment.Center });
-                panel.Children.Add(new TextBlock { Text = "Войдите (можно через Google) и нажмите «Authorize».\nЛимиты появятся здесь сами.", FontSize = 12,
-                                                   Foreground = B("#AEAEB2"), TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 6, 0, 12) });
-                var row = new Grid();
-                row.ColumnDefinitions.Add(new ColumnDefinition());
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(8) });
-                row.ColumnDefinitions.Add(new ColumnDefinition());
-                var cancel = PanelButton("Отмена", B("#3A3A3C"), CancelLogin);
-                var again = PanelButton("Открыть снова", B(Accent), () => { if (loginUrl != null) OpenUrl(loginUrl); });
-                again.Opacity = loginUrl != null ? 1 : 0.5;
-                Grid.SetColumn(again, 2);
-                row.Children.Add(cancel);
-                row.Children.Add(again);
-                panel.Children.Add(row);
-                return panel;
-            }
-            panel.Children.Add(new TextBlock { Text = "Войдите в свой аккаунт Claude,\nчтобы видеть лимиты использования.", FontSize = 12.5,
-                                               Foreground = B("#AEAEB2"), TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 0, 0, 12) });
-            var button = new Border { CornerRadius = new CornerRadius(6), Background = B(Accent), Padding = new Thickness(16, 7, 16, 8), Cursor = System.Windows.Input.Cursors.Hand,
-                                      Child = new TextBlock { Text = "Войти в Claude", FontSize = 13, FontWeight = FontWeights.SemiBold, Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center } };
-            button.MouseEnter += (s, e) => button.Opacity = 0.9;
-            button.MouseLeave += (s, e) => button.Opacity = 1;
-            button.MouseLeftButtonUp += (s, e) => { e.Handled = true; Login(); };
-            button.MouseLeftButtonDown += (s, e) => e.Handled = true;
-            panel.Children.Add(button);
-            panel.Children.Add(new TextBlock { Text = "Откроется браузер — можно войти через Google.", FontSize = 11, Foreground = B("#8E8E93"),
-                                               TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 8, 0, 0) });
-            return panel;
-        }
-
         // ---------- подробности (по нажатию на виджет) ----------
         string Acc(string key)
         {
@@ -2579,7 +2570,7 @@ namespace AiLimitWidget
             if (!settings.ShowDetails) return;
 
             // аккаунты: почта и тариф; одинаковая почта у всех — одной строкой сверху
-            bool claudeOn = settings.ShowClaude && !loggedOut, agyOn = settings.ShowAgy && !agyMissing, codexOn = settings.ShowCodex && !codexMissing;
+            bool claudeOn = ClaudeOn, agyOn = AgyOn, codexOn = CodexOn;
             var accounts = new List<Tuple<Color, string, string, string>>();   // цвет, сервис, почта, тариф
             if (claudeOn) accounts.Add(Tuple.Create(Accent, "Claude Code", Acc("emailAddress"), plan.Length > 0 ? "Claude " + plan : null));
             if (agyOn) accounts.Add(Tuple.Create(GeminiColor, "Antigravity", agyEmail, (string)null));
@@ -2819,7 +2810,7 @@ namespace AiLimitWidget
         {
             if (tray == null) return;
             DateTime now = DateTime.Now;
-            AgyGroup ag = settings.ShowAgy ? ClockGroup() : null;
+            AgyGroup ag = AgyOn ? ClockGroup() : null;
             double agyPct = ag == null ? 0 : Current(ag.Short, now);
             var tip = new List<string>();
             if (settings.ShowClaude && session != null) tip.Add("Claude " + Math.Round(pct) + "%" + (weekly.Count > 0 ? " (нед. " + Math.Round(Current(weekly[0], now)) + "%)" : ""));
@@ -2832,7 +2823,7 @@ namespace AiLimitWidget
             tray.Text = text63.Length > 63 ? text63.Substring(0, 63) : text63;
 
             // главное число — сессия Claude; если Claude скрыт — сессия Antigravity
-            bool claudeMain = settings.ShowClaude;
+            bool claudeMain = ClaudeOn;
             bool known = claudeMain ? session != null : ag != null && ag.Short != null;
             double main = claudeMain ? pct : agyPct;
             bool stripe = claudeMain && ag != null && ag.Short != null;   // полоска снизу цвета группы — сессия Antigravity
@@ -3042,7 +3033,7 @@ namespace AiLimitWidget
 
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
 
-        bool LoggedIn { get { return !loggedOut; } }
+        bool LoggedIn { get { return ClaudeAvail; } }
 
         void BuildMenu()
         {
@@ -3057,9 +3048,10 @@ namespace AiLimitWidget
             menu.Items.Add(new Separator());
             menu.Items.Add(Sub("Показывать",
                 new[] {
-                    ServiceToggle("Claude Code", settings.ShowClaude, v => { settings.ShowClaude = v; SetLoggedOut("claude", false); }, Fetch),
-                    ServiceToggle("Antigravity", settings.ShowAgy, v => { settings.ShowAgy = v; SetLoggedOut("agy", false); }, FetchAgy),
-                    ServiceToggle("Codex", settings.ShowCodex, v => { settings.ShowCodex = v; SetLoggedOut("codex", false); }, FetchCodex) }
+                    ClaudeAvail ? ServiceToggle("Claude Code", settings.ShowClaude, v => { settings.ShowClaude = v; SetLoggedOut("claude", false); }, Fetch) : null,
+                    AgyAvail ? ServiceToggle("Antigravity", settings.ShowAgy, v => { settings.ShowAgy = v; SetLoggedOut("agy", false); }, FetchAgy) : null,
+                    CodexAvail ? ServiceToggle("Codex", settings.ShowCodex, v => { settings.ShowCodex = v; SetLoggedOut("codex", false); }, FetchCodex) : null }
+                .Where(i => i != null)
                 .Concat(extras.Where(x => x.SignedIn).Select(x => ServiceToggle(x.Name, ExtraOn(x.Key), v =>
                 {
                     var list = settings.HiddenExtras.Split(',').Where(k => k.Length > 0 && k != x.Key).ToList();
@@ -3067,7 +3059,7 @@ namespace AiLimitWidget
                     settings.HiddenExtras = string.Join(",", list);
                 }, () => FetchExtra(x)))).ToArray()));
             // столбцы других ИИ — только тех, в которые вошли
-            menu.Items.Add(Sub("У часов", ClockColumns.Where(c => { var x = ExtraFor(c[0]); return x == null || x.SignedIn; })
+            menu.Items.Add(Sub("У часов", ClockColumns.Where(c => { var x = ExtraFor(c[0]); return x != null ? x.SignedIn : c[0] == "claude" ? ClaudeAvail : c[0] == "codex" ? CodexAvail : AgyAvail; })
                                                       .Select(c => ClockToggle(c[0], c[1])).ToArray()));
             menu.Items.Add(Toggle("Не скрывать при нажатии мимо", settings.KeepOpen, () => { settings.KeepOpen = !settings.KeepOpen; SaveSettings(); }));
             menu.Items.Add(Toggle("Показывать у часов", settings.ClockLabel, () =>
@@ -3097,18 +3089,16 @@ namespace AiLimitWidget
             menu.Items.Add(new Separator());
             // выход — только из тех сервисов, где вход есть; какой именно, выбирают в подменю
             var outs = new List<MenuItem>();
-            if (settings.ShowClaude && LoggedIn) outs.Add(Item("Claude Code", false, () => Logout("claude")));
-            if (settings.ShowAgy && !agyMissing && agyGroups.Count > 0) outs.Add(Item("Antigravity", false, () => Logout("agy")));
-            if (settings.ShowCodex && !codexMissing) outs.Add(Item("Codex", false, () => Logout("codex")));
+            if (ClaudeOn) outs.Add(Item("Claude Code", false, () => Logout("claude")));
+            if (AgyOn) outs.Add(Item("Antigravity", false, () => Logout("agy")));
+            if (CodexOn) outs.Add(Item("Codex", false, () => Logout("codex")));
             if (outs.Count > 0) menu.Items.Add(Sub("Выйти из аккаунта", outs.ToArray()));
-            if (settings.ShowClaude && !LoggedIn) menu.Items.Add(Item("Войти в Claude…", false, Login));
             menu.Items.Add(Item("Закрыть", false, Exit));
         }
 
         // ---------- вход и выход ----------
-        // Вход у виджета общий с Claude Code, поэтому входим и выходим его же командами:
-        // «claude auth login» открывает браузер по умолчанию (Chrome — там уже есть вход через Google),
-        // «claude auth logout» удаляет ключи входа.
+        // Сам виджет войти не просит — берёт вход, который уже есть у Claude Code, Codex, Antigravity и других ИИ.
+        // Выходим их же командами: «claude auth logout» удаляет ключи входа.
         static string ClaudeExe
         {
             get
@@ -3116,56 +3106,6 @@ namespace AiLimitWidget
                 string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "claude.exe");
                 return File.Exists(local) ? local : "claude";
             }
-        }
-
-        System.Diagnostics.Process loginProc;
-        string loginUrl;
-
-        // «claude auth login» без окна консоли: он сам открывает браузер (Chrome — вход через Google),
-        // а ссылку на случай, если браузер не открылся, забираем из его вывода
-        void Login()
-        {
-            if (loginProc != null)
-            {
-                if (loginUrl != null) OpenUrl(loginUrl);   // вход уже идёт — просто открыть страницу снова
-                return;
-            }
-            loginUrl = null;
-            try
-            {
-                var psi = new System.Diagnostics.ProcessStartInfo(ClaudeExe, "auth login --claudeai") {
-                    UseShellExecute = false, CreateNoWindow = true,
-                    RedirectStandardOutput = true, RedirectStandardError = true, RedirectStandardInput = true };
-                var proc = new System.Diagnostics.Process { StartInfo = psi, EnableRaisingEvents = true };
-                System.Diagnostics.DataReceivedEventHandler grab = (s, e) =>
-                {
-                    var m = System.Text.RegularExpressions.Regex.Match(e.Data ?? "", @"https://\S+");
-                    if (m.Success && loginUrl == null) dispatcher.BeginInvoke(new Action(() => { loginUrl = m.Value; UpdateView(); }));
-                };
-                proc.OutputDataReceived += grab;
-                proc.ErrorDataReceived += grab;
-                proc.Exited += (s, e) => dispatcher.BeginInvoke(new Action(() =>
-                {
-                    loginProc = null;
-                    loginUrl = null;
-                    Fetch();
-                }));
-                proc.Start();
-                proc.BeginOutputReadLine();
-                proc.BeginErrorReadLine();
-                loginProc = proc;
-            }
-            catch (Exception) { SetStatus("Claude Code не найден — установите его и выполните claude", true); }
-            if (!window.IsVisible) ShowWidget();
-            UpdateView();
-        }
-
-        void CancelLogin()
-        {
-            try { if (loginProc != null && !loginProc.HasExited) loginProc.Kill(); } catch (Exception) { }
-            loginProc = null;
-            loginUrl = null;
-            UpdateView();
         }
 
         static void OpenUrl(string url)
@@ -3191,7 +3131,7 @@ namespace AiLimitWidget
             }
         }
 
-        int ShownServices { get { return (settings.ShowClaude ? 1 : 0) + (settings.ShowAgy ? 1 : 0) + (settings.ShowCodex ? 1 : 0) + ShownExtras.Count; } }
+        int ShownServices { get { return (ClaudeOn ? 1 : 0) + (AgyOn ? 1 : 0) + (CodexOn ? 1 : 0) + ShownExtras.Count; } }
 
         // подтверждение показываем в самом окне (отдельное окно-вопрос пряталось за другими окнами);
         // из какого сервиса выходить, выбирают в меню «Выйти из аккаунта»
@@ -3232,14 +3172,12 @@ namespace AiLimitWidget
         }
 
         // после выхода сведения о сервисе больше не показываем: раздел, столбец у часов и подробности прячутся
-        // (если это был единственный сервис в окне — раздел остаётся, в нём предложение войти)
         void AfterLogout(string target)
         {
-            bool hide = ShownServices > 1;
             if (target == "claude")
             {
                 ClearData();
-                if (hide) { settings.ShowClaude = false; SetLoggedOut("claude", true); }
+                settings.ShowClaude = false; SetLoggedOut("claude", true);
             }
             else if (target == "agy")
             {
@@ -3248,8 +3186,7 @@ namespace AiLimitWidget
                 agyCredits = null;
                 agyUpdatedAt = null;
                 try { File.Delete(agyCachePath); } catch (Exception) { }
-                if (hide) { settings.ShowAgy = false; SetLoggedOut("agy", true); }
-                else SetAgyStatus("Нет входа в Antigravity — запустите agy и войдите", false);
+                settings.ShowAgy = false; SetLoggedOut("agy", true);
                 // окно agy с /logout ещё открыто — первую пробу делаем не сразу, а через обычный интервал
                 agyNextFetch = DateTime.Now.AddMinutes(settings.RefreshMinutes);
             }
@@ -3260,7 +3197,7 @@ namespace AiLimitWidget
                 codexPlan = "";
                 codexUpdatedAt = null;
                 try { File.Delete(codexCachePath); } catch (Exception) { }
-                if (hide) { settings.ShowCodex = false; SetLoggedOut("codex", true); }
+                settings.ShowCodex = false; SetLoggedOut("codex", true);
             }
             SaveSettings();
             lastTrayKey = null;
@@ -3331,7 +3268,7 @@ namespace AiLimitWidget
             string what = logoutTarget == "agy" ? "Откроется окно Antigravity и выполнит /logout —\nпосле выхода закройте его."
                         : logoutTarget == "codex" ? "Вход общий с Codex — в нём тоже\nнужно будет войти заново (codex login)."
                         : "Вход общий с Claude Code — в нём тоже\nнужно будет войти заново.";
-            if (ShownServices > 1) what += "\n\nРаздел пропадёт из виджета.\nВернуть: ⋯ → Показывать.";
+            what += "\n\nРаздел пропадёт из виджета\nи вернётся сам после нового входа.";
             panel.Children.Add(new TextBlock { Text = what, FontSize = 12, Foreground = B("#AEAEB2"),
                                                TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 6, 0, 12) });
             var buttons = new Grid();

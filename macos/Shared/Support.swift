@@ -234,16 +234,19 @@ func submenu(_ title: String, _ items: [NSMenuItem]) -> NSMenuItem {
 // Полноэкранная программа (Telegram, Safari и т. п. в своём пространстве): строка меню скрыта,
 // и виджет не должен всплывать, когда курсор просто подходит к верхнему краю экрана.
 enum FullScreen {
-    static func isActive() -> Bool {
+    static func isActive(on screen: NSScreen? = nil) -> Bool {
         guard let front = NSWorkspace.shared.frontmostApplication?.processIdentifier,
               let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
         else { return false }
+        // строка меню спрятана (полноэкранное пространство) — экран без отступа под неё
+        if let sc = screen, sc.visibleFrame.maxY >= sc.frame.maxY - 1 { return true }
         let screens = NSScreen.screens.map { $0.frame.size }
         for w in list {
             guard (w[kCGWindowOwnerPID as String] as? Int32) == front, (w[kCGWindowLayer as String] as? Int) == 0,
                   (w[kCGWindowAlpha as String] as? Double ?? 1) > 0, let b = w[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
             let size = CGSize(width: b["Width"] ?? 0, height: b["Height"] ?? 0)
-            if screens.contains(where: { abs($0.width - size.width) < 1 && abs($0.height - size.height) < 1 }) { return true }
+            // окно от самого верха почти во весь экран — Терминал и др. подгоняют высоту под сетку символов
+            if (b["Y"] ?? 1) < 1, screens.contains(where: { abs($0.width - size.width) < 2 && size.height >= $0.height - 40 }) { return true }
         }
         return false
     }

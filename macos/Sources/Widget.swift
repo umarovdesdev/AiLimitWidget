@@ -1076,10 +1076,13 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     func checkHover() {
         guard s.clockLabel, let b = statusItem?.button, let bw = b.window else { hoverSince = nil; return }
         let pt = NSEvent.mouseLocation
-        let overLabel = bw.frame.insetBy(dx: -2, dy: -4).contains(pt)
+        // строка меню спрятана (полноэкранная программа) — значок за краем экрана, наведение не считаем
+        let barShown = bw.occlusionState.contains(.visible) && (bw.screen.map { bw.frame.maxY <= $0.frame.maxY + 1 } ?? false)
+        let overLabel = barShown && bw.frame.insetBy(dx: -2, dy: -4).contains(pt)
         let overWindow = popover.isShown && (popover.contentViewController?.view.window?.frame.insetBy(dx: -2, dy: -8).contains(pt) ?? false)
         if preview {
-            if !overLabel && !overWindow { hideWidget() }
+            // ушли в полноэкранную программу — превью закрываем, иначе строка меню не прячется
+            if (!overLabel && !overWindow) || FullScreen.isActive(on: bw.screen) { hideWidget() }
             return
         }
         if !overLabel || popover.isShown { hoverSince = nil; return }
@@ -1087,7 +1090,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         if Date().timeIntervalSince(hoverSince!) < 0.4 { return }
         hoverSince = nil
         // полноэкранная программа — строка меню выезжает от курсора у края, панель не показываем
-        if FullScreen.isActive() { return }
+        if FullScreen.isActive(on: bw.screen) { return }
         preview = true
         present()
     }

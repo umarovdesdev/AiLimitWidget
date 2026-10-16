@@ -38,6 +38,7 @@ namespace AiLimitWidget
         public bool ShowDetails;                                   // развёрнуты ли подробности (аккаунт, на что ушла неделя)
         public string ClockItems = "claude,gemini,3p,codex,geminicli,copilot,cursor";   // что показывать у часов: claude, gemini (Antigravity), 3p (Claude и GPT в Antigravity), codex, другие ИИ
         public int ClockVersion;                                   // 2 — в ClockItems уже учтён столбец codex, 3 — столбцы других ИИ
+        public string AgyKeys = "gemini,3p";                       // группы Antigravity, которые уже встречались: новая (например, Gemini 4 Argon) сама получает столбец у часов
         public string HiddenExtras = "";                           // другие ИИ (Gemini CLI, Copilot, Cursor), которые выключили в «Показывать»
         public string LoggedOut = "";                              // сервисы, скрытые из-за выхода: вернутся сами, когда в них снова войдут
     }
@@ -784,12 +785,27 @@ namespace AiLimitWidget
         static readonly int[] RefreshOptions = { 1, 2, 5, 10 };
         static readonly int[] NotifyThresholds = { 80, 95 };
 
-        // недельные лимиты, которые показываем строками под кольцом (остальные поля ответа — служебные)
+        // известные лимиты Claude — с понятными названиями и в этом порядке; остальные лимиты из ответа
+        // (новые, которых тут нет) показываются после них сами — с названием из ключа или суммой в долларах
         static readonly string[][] WeeklyKeys = {
             new[] { "seven_day", "Неделя · все модели" },
             new[] { "seven_day_opus", "Неделя · Opus" },
-            new[] { "seven_day_sonnet", "Неделя · Sonnet" }
+            new[] { "seven_day_sonnet", "Неделя · Sonnet" },
+            new[] { "seven_day_cowork", "Неделя · Cowork" },
+            new[] { "seven_day_oauth_apps", "Неделя · приложения" }
         };
+
+        static string LimitTitle(string key, Dictionary<string, object> o)
+        {
+            var known = WeeklyKeys.FirstOrDefault(w => w[0] == key);
+            if (known != null) return known[1];
+            object limit = Get(o, "limit_dollars");
+            if (limit != null)
+                return "Кредиты: $" + Math.Round(Convert.ToDouble(Get(o, "used_dollars") ?? 0, Inv), 2).ToString(Inv) + " из $" + Convert.ToDouble(limit, Inv).ToString(Inv);
+            string name = (key.StartsWith("seven_day_") ? key.Substring(10) : key).Replace('_', ' ');
+            name = char.ToUpper(name[0]) + name.Substring(1);
+            return key.StartsWith("seven_day") ? "Неделя · " + name : name;
+        }
 
         // у каждого лимита свой цвет: Claude Code — оранжевый, Gemini — зелёный,
         // Claude и GPT внутри Antigravity — синий, Codex (когда добавится) — жёлтый
@@ -803,15 +819,53 @@ namespace AiLimitWidget
                 case "claude": return Accent;
                 case "gemini": return GeminiColor;
                 case "codex": return CodexColor;
+                case "3p": return AgyClaudeColor;   // Claude и GPT в Antigravity
                 default:
                     var extra = Extra.All.FirstOrDefault(x => x[0] == key);
-                    return extra != null ? C(extra[2]) : AgyClaudeColor;   // 3p — Claude и GPT в Antigravity
+                    if (extra != null) return C(extra[2]);
+                    // новые группы Antigravity: Argon — индиго (аргон светится фиолетовым), остальные — из запасной палитры;
+                    // цвет зависит только от названия группы, поэтому не меняется между запусками
+                    if ((key ?? "").Contains("argon")) return C("#7D7AFF");
+                    int h = 0;
+                    foreach (char ch in key ?? "") h = (h * 31 + ch) & 0x7FFFFFFF;
+                    return C(SparePalette[h % SparePalette.Length]);
             }
         }
 
-        // столбцы надписи у часов, слева направо
-        static readonly string[][] ClockColumns = new[] { new[] { "claude", "Claude Code" }, new[] { "gemini", "Gemini" }, new[] { "3p", "Claude и GPT (Antigravity)" }, new[] { "codex", "Codex" } }
-            .Concat(Extra.All.Select(x => new[] { x[0], x[1] })).ToArray();
+        // не повторяют цвета сервисов и не похожи на оранжевый/красный, которыми помечаются почти исчерпанные лимиты
+        static readonly string[] SparePalette = { "#FF6482", "#66D4CF", "#A8E05F", "#AC8E68", "#DA8FFF" };
+
+        static string AgyColumnTitle(string key, string title)
+        {
+            return key == "gemini" ? "Gemini" : key == "3p" ? "Claude и GPT (Antigravity)" : (title ?? key) + " (Antigravity)";
+        }
+
+        // столбцы надписи у часов, слева направо: Claude Code, все группы Antigravity, Codex, другие ИИ
+        string[][] ClockColumns
+        {
+            get
+            {
+                var agy = settings.AgyKeys.Split(',').Where(k => k.Length > 0).Select(k =>
+                {
+                    var g = agyGroups.FirstOrDefault(x => x.Key == k);
+                    return new[] { k, AgyColumnTitle(k, g == null ? null : g.Title) };
+                });
+                return new[] { new[] { "claude", "Claude Code" } }.Concat(agy).Concat(new[] { new[] { "codex", "Codex" } })
+                    .Concat(Extra.All.Select(x => new[] { x[0], x[1] })).ToArray();
+            }
+        }
+
+        // новая группа Antigravity: запоминаем и сразу включаем её столбец у часов
+        void RememberAgyKeys()
+        {
+            var known = settings.AgyKeys.Split(',').Where(k => k.Length > 0).ToList();
+            var fresh = agyGroups.Select(g => g.Key).Where(k => !string.IsNullOrEmpty(k) && !k.Contains(",") && !known.Contains(k)).ToList();
+            if (fresh.Count == 0) return;
+            settings.AgyKeys = string.Join(",", known.Concat(fresh));
+            var items = settings.ClockItems.Split(',').Where(x => x.Length > 0).Concat(fresh).ToList();
+            settings.ClockItems = string.Join(",", ClockColumns.Select(c => c[0]).Where(items.Contains));
+            SaveSettings();
+        }
 
         bool ClockShows(string key) { return settings.ClockItems.Split(',').Contains(key); }
 
@@ -880,11 +934,15 @@ namespace AiLimitWidget
         TextBlock[] clockNames;
         TextBlock[,] clockValues;
         FrameworkElement[,] clockCells;
+        Border clockBox;
+        string clockKeys;   // столбцы, из которых собрана надпись сейчас
 
-        void InitClockLabel()
+        Grid BuildClockGrid()
         {
+            var cols = ClockColumns;
+            clockKeys = string.Join(",", cols.Select(c => c[0]));
             var text = new Grid { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };   // окно не бывает уже ~133 точек — текст прижат вправо, к стрелке
-            int n = ClockColumns.Length;
+            int n = cols.Length;
             for (int c = 0; c <= n; c++) text.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             clockNames = new TextBlock[2];
             clockValues = new TextBlock[2, n];
@@ -899,7 +957,7 @@ namespace AiLimitWidget
                 {
                     clockValues[i, p] = new TextBlock { FontSize = 12, FontWeight = FontWeights.SemiBold, TextAlignment = TextAlignment.Right, MinWidth = 26 };
                     var cell = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(p == 0 ? 5 : 6, 0, 0, 0) };
-                    cell.Children.Add(new System.Windows.Shapes.Ellipse { Width = 6, Height = 6, Fill = B(GroupColor(ClockColumns[p][0])), VerticalAlignment = VerticalAlignment.Center,
+                    cell.Children.Add(new System.Windows.Shapes.Ellipse { Width = 6, Height = 6, Fill = B(GroupColor(cols[p][0])), VerticalAlignment = VerticalAlignment.Center,
                                                     Margin = new Thickness(0, 1, 3, 0) });
                     cell.Children.Add(clockValues[i, p]);
                     Grid.SetRow(cell, i);
@@ -908,8 +966,13 @@ namespace AiLimitWidget
                     clockCells[i, p] = cell;
                 }
             }
+            return text;
+        }
+
+        void InitClockLabel()
+        {
             // почти прозрачный фон — чтобы по надписи можно было нажать
-            var box = new Border { Padding = new Thickness(8, 3, 0, 3), Child = text };
+            var box = clockBox = new Border { Padding = new Thickness(8, 3, 0, 3), Child = BuildClockGrid() };
             clock = new Window {
                 WindowStyle = WindowStyle.None, AllowsTransparency = true, Background = Brushes.Transparent, ResizeMode = ResizeMode.NoResize,
                 ShowInTaskbar = false, ShowActivated = false, Topmost = true, SizeToContent = SizeToContent.WidthAndHeight,
@@ -1011,13 +1074,15 @@ namespace AiLimitWidget
             bool light = TaskbarLightTheme;
             DateTime now = DateTime.Now;
             Limit week = weekly.Count > 0 ? weekly[0] : null;
-            int n = ClockColumns.Length;
+            var cols = ClockColumns;
+            if (string.Join(",", cols.Select(c => c[0])) != clockKeys) clockBox.Child = BuildClockGrid();   // появилась новая группа Antigravity
+            int n = cols.Length;
             // [строка, столбец]: строка 0 — сессия (5 ч), 1 — неделя
             var limits = new Limit[2, n];
             var shown = new bool[n];
             for (int p = 0; p < n; p++)
             {
-                string key = ClockColumns[p][0];
+                string key = cols[p][0];
                 if (key == "claude")
                 {
                     shown[p] = settings.ShowClaude;
@@ -1059,7 +1124,7 @@ namespace AiLimitWidget
                     Limit l = limits[i, p];
                     double v = Current(l, now);
                     // у другого ИИ один лимит (например, месяц у Copilot) — нижняя строка пустая
-                    string text = l != null ? Math.Round(v) + "%" : i == 1 && ExtraFor(ClockColumns[p][0]) != null ? "" : "—";
+                    string text = l != null ? Math.Round(v) + "%" : i == 1 && ExtraFor(cols[p][0]) != null ? "" : "—";
                     if (clockValues[i, p].Text != text) clockValues[i, p].Text = text;
                     SetInk(clockValues[i, p], v >= 75 ? Severity(v) : C(light ? "#1C1C1E" : "#FFFFFF"));
                 }
@@ -1176,6 +1241,7 @@ namespace AiLimitWidget
                 if (Get(d, "ShowDetails") is bool) settings.ShowDetails = (bool)Get(d, "ShowDetails");
                 if ((v = Get(d, "ClockItems")) != null) settings.ClockItems = Convert.ToString(v, Inv);
                 if ((v = Get(d, "HiddenExtras")) != null) settings.HiddenExtras = Convert.ToString(v, Inv);
+                if ((v = Get(d, "AgyKeys")) != null) settings.AgyKeys = Convert.ToString(v, Inv);
             }
             catch (Exception) { }
             if (!Positions.Contains(settings.Position)) settings.Position = "TR";
@@ -1205,7 +1271,7 @@ namespace AiLimitWidget
                     { "Left", settings.Left }, { "Top", settings.Top }, { "KeepOpen", settings.KeepOpen }, { "Notify", settings.Notify }, { "ClockLabel", settings.ClockLabel },
                     { "ShowClaude", settings.ShowClaude }, { "ShowAgy", settings.ShowAgy }, { "ShowCodex", settings.ShowCodex },
                     { "ClockItems", settings.ClockItems }, { "ClockVersion", settings.ClockVersion }, { "LoggedOut", settings.LoggedOut }, { "ShowDetails", settings.ShowDetails },
-                    { "HiddenExtras", settings.HiddenExtras } };
+                    { "HiddenExtras", settings.HiddenExtras }, { "AgyKeys", settings.AgyKeys } };
                 File.WriteAllText(settingsPath, json.Serialize(d), new UTF8Encoding(false));
             }
             catch (Exception) { }
@@ -1360,9 +1426,12 @@ namespace AiLimitWidget
                 if (d == null) return false;
                 session = ReadLimit(d, "five_hour", "Сессия (5 ч)") ?? new Limit { Key = "five_hour", Title = "Сессия (5 ч)" };
                 weekly.Clear();
-                foreach (var w in WeeklyKeys)
+                var keys = WeeklyKeys.Select(w => w[0]).Concat(d.Keys.Where(k => k != "five_hour" && k != "extra_usage" && WeeklyKeys.All(w => w[0] != k)));
+                foreach (var k in keys)
                 {
-                    var l = ReadLimit(d, w[0], w[1]);
+                    var o = Get(d, k) as Dictionary<string, object>;
+                    if (o == null || Get(o, "utilization") == null) continue;
+                    var l = ReadLimit(d, k, LimitTitle(k, o));
                     if (l != null) weekly.Add(l);
                 }
                 // платные кредиты сверх подписки — только если включены
@@ -1550,6 +1619,7 @@ namespace AiLimitWidget
                 }
                 agyGroups.Clear();
                 agyGroups.AddRange(list);
+                RememberAgyKeys();
                 return true;
             }
             catch (Exception) { return false; }
@@ -2132,7 +2202,8 @@ namespace AiLimitWidget
                 if (settings.ShowAgy)
                 {
                     string credits = agyCredits.HasValue && agyCredits.Value > 0 ? "кредиты: " + Math.Round(agyCredits.Value) : null;
-                    rows.Children.Add(ProviderHeader("Antigravity", new[] { GeminiColor, AgyClaudeColor }, credits, rows.Children.Count == 0));
+                    var agyColors = agyGroups.Count > 0 ? agyGroups.Select(g => GroupColor(g.Key)).Distinct().ToArray() : new[] { GeminiColor, AgyClaudeColor };
+                    rows.Children.Add(ProviderHeader("Antigravity", agyColors, credits, rows.Children.Count == 0));
                     if (agyGroups.Count == 0 && string.IsNullOrEmpty(agyStatus))
                         rows.Children.Add(Hint("Загрузка…"));
                     foreach (var g in agyGroups) rows.Children.Add(AgyRow(g, now));
@@ -2253,10 +2324,14 @@ namespace AiLimitWidget
             cols.ColumnDefinitions.Add(new ColumnDefinition());
             cols.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(14) });
             cols.ColumnDefinitions.Add(new ColumnDefinition());
-            var left = MiniBar("5 часов", g.Session, now, color, g.SessionOff ? "не действует — неделя исчерпана" : null);
             var right = MiniBar("Неделя", g.Week, now, color);
-            Grid.SetColumn(right, 2);
-            cols.Children.Add(left);
+            if (g.Session == null && !g.SessionOff)   // у группы только недельный лимит (например, Gemini 4 Argon)
+                Grid.SetColumnSpan(right, 3);
+            else
+            {
+                cols.Children.Add(MiniBar("5 часов", g.Session, now, color, g.SessionOff ? "не действует — неделя исчерпана" : null));
+                Grid.SetColumn(right, 2);
+            }
             cols.Children.Add(right);
             panel.Children.Add(cols);
 

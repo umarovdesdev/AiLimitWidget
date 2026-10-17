@@ -398,6 +398,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
 
     // обновить всё, что показываем
     func fetchAll() {
+        if !online { netCheckAt = .distantPast; watchNet(); return }   // появится сеть — watchNet обновит всё сам
         fetch()
         fetchAgy()
         fetchCodex()
@@ -533,6 +534,11 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
                 missing = q.missing
                 if quota != nil { credits = Proc.run(exe, ["-p", "/credits", "--output-format", "json"], env: env).output }
             }
+            // сеть пропала, пока agy работал, — его «нет входа» не верим
+            if !missing && !Net.up() {
+                DispatchQueue.main.async { self.agyOffline() }
+                return
+            }
             let email = Widget.readAgyEmail()
             DispatchQueue.main.async { self.fetchAgyDone(quota, credits, email, missing) }
         }
@@ -559,7 +565,8 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     private func agyOffline() {
         agyFetching = false
         agyNextFetch = Date().addingTimeInterval(60)
-        if agyUpdatedAt == nil { setAgyStatus("Нет сети — повторю через минуту", false) }
+        setAgyStatus(Widget.offlineText, false)
+        goneOffline()
         updateView()
     }
 
@@ -799,6 +806,18 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         p.nextFetch = Date().addingTimeInterval(TimeInterval(s.refreshMinutes * 60))
         DispatchQueue.global().async {
             let r = Extra.fetch(p.key)
+            // без сети ответ «входа нет» или ошибка ничего не значат — раздел не прячем, ждём сеть
+            if (!r.signedIn || r.problem != nil) && !Net.up() {
+                DispatchQueue.main.async {
+                    p.fetching = false
+                    p.nextFetch = Date().addingTimeInterval(60)
+                    self.goneOffline()
+                    p.status = Widget.offlineText
+                    p.statusIsError = false
+                    self.updateView()
+                }
+                return
+            }
             DispatchQueue.main.async {
                 p.fetching = false
                 let wasShown = p.signedIn
@@ -850,8 +869,52 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         }
     }
 
+    // ---------- сеть ----------
+    // Без интернета никого не спрашиваем: ни запросов, ни команд CLI, ни проверок входа —
+    // иначе сервисы решают, что входа нет, и просят войти заново. Старые данные остаются на месте.
+    // Сеть проверяем в фоне раз в 5 с; появилась — сразу обновляем всё.
+    static let offlineText = "Нет сети — обновлю, когда появится интернет"
+    private var online = false, netKnown = false   // до первой проверки считаем, что сети нет
+    private var netChecking = false
+    private var netCheckAt = Date.distantPast
+
+    func watchNet() {
+        if netChecking || Date() < netCheckAt { return }
+        netChecking = true
+        netCheckAt = Date().addingTimeInterval(5)
+        DispatchQueue.global().async {
+            let up = Net.up()
+            DispatchQueue.main.async {
+                self.netChecking = false
+                let was = self.online, first = !self.netKnown
+                self.online = up
+                self.netKnown = true
+                if !up && (was || first) { self.showOffline() }
+                if up && !was { self.fetchAll() }
+                self.updateView()
+            }
+        }
+    }
+
+    // запрос сам заметил, что сети нет (раньше фоновой проверки) — останавливаем всех до её возвращения
+    func goneOffline() {
+        if !online { return }
+        online = false
+        showOffline()
+        netCheckAt = Date().addingTimeInterval(5)
+    }
+
+    func showOffline() {
+        setStatus(Widget.offlineText, false)
+        setAgyStatus(Widget.offlineText, false)
+        setCodexStatus(Widget.offlineText, false)
+        for p in extras { p.status = Widget.offlineText; p.statusIsError = false }
+    }
+
     // ---------- обновление по таймеру ----------
     func tick() {
+        watchNet()
+        if !online { updateView(); return }
         let now = Date()
         let window = TimeInterval(s.refreshMinutes * 60)
         // окно лимита закончилось — спрашиваем новые данные раньше срока

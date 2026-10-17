@@ -122,6 +122,19 @@ enum Proc {
     }
 }
 
+// Есть ли интернет: после включения или пробуждения Mac сеть появляется не сразу.
+// Без сети agy считает, что входа нет, и просит войти заново — поэтому без сети его не запускаем.
+enum Net {
+    static func up(_ host: String = "oauth2.googleapis.com") -> Bool {
+        var hints = addrinfo(ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM, ai_protocol: 0,
+                             ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+        var res: UnsafeMutablePointer<addrinfo>?
+        let rc = getaddrinfo(host, "443", &hints, &res)
+        if let r = res { freeaddrinfo(r) }
+        return rc == 0
+    }
+}
+
 // Приложения, открытые из Finder, не получают PATH из ~/.zshrc — узнаём его у оболочки один раз.
 enum Shell {
     static let home = NSHomeDirectory()
@@ -141,9 +154,23 @@ enum Shell {
         return list
     }
 
+    // Всё, что виджет запускает, работает в фоне: окна входа в браузере не открываются.
+    // agy и другие CLI открывают браузер командой «open» из PATH — подменяем её пустышкой.
+    static let quietBin: String = {
+        let dir = home + "/Library/Application Support/AiLimitWidget/quiet-bin"
+        let open = dir + "/open"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: open) {
+            FileManager.default.createFile(atPath: open, contents: "#!/bin/sh\nexit 0\n".data(using: .utf8),
+                                           attributes: [.posixPermissions: 0o755])
+        }
+        return dir
+    }()
+
     static var environment: [String: String] {
         var e = ProcessInfo.processInfo.environment
-        e["PATH"] = dirs.joined(separator: ":")
+        e["PATH"] = ([quietBin] + dirs).joined(separator: ":")
+        e["BROWSER"] = "/usr/bin/true"
         return e
     }
 

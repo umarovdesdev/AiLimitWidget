@@ -518,6 +518,10 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         updateAgy(minutes: s.refreshMinutes)
         updateView()
         DispatchQueue.global().async {
+            if !Net.up() {
+                DispatchQueue.main.async { self.agyOffline() }
+                return
+            }
             var quota: String?, credits: String?
             var missing = true
             if let exe = Widget.agyExe {
@@ -545,9 +549,18 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         agyUpdateCheck = Date()
         agyUpdating = true
         DispatchQueue.global().async {
-            _ = Proc.run(exe, ["update"], timeout: 600)
+            if Net.up() { _ = Proc.run(exe, ["update"], timeout: 600) }
+            else { DispatchQueue.main.async { self.agyUpdateCheck = .distantPast } }   // без сети — попробуем в следующий раз
             DispatchQueue.main.async { self.agyUpdating = false }
         }
+    }
+
+    // сети пока нет: старые данные оставляем, повторяем через минуту
+    private func agyOffline() {
+        agyFetching = false
+        agyNextFetch = Date().addingTimeInterval(60)
+        if agyUpdatedAt == nil { setAgyStatus("Нет сети — повторю через минуту", false) }
+        updateView()
     }
 
     private func fetchAgyDone(_ quota: String?, _ credits: String?, _ email: String?, _ missing: Bool) {

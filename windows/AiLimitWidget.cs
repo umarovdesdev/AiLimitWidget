@@ -1443,6 +1443,7 @@ namespace AiLimitWidget
         // обновить всё, что показываем
         void FetchAll()
         {
+            if (!online) { netCheckAt = DateTime.MinValue; WatchNet(); return; }   // появится сеть — WatchNet обновит всё сам
             Fetch();
             FetchAgy();
             FetchCodex();
@@ -1637,6 +1638,8 @@ namespace AiLimitWidget
                 string quota = RunAgy("/quota", out missing);
                 bool ignored;
                 string credits = quota == null ? null : RunAgy("/credits", out ignored);
+                // сеть пропала, пока agy работал, — его «нет входа» не верим
+                if (!missing && !NetUp()) { dispatcher.BeginInvoke(new Action(AgyOffline)); return; }
                 string email = ReadAgyEmail();
                 dispatcher.BeginInvoke(new Action(() => FetchAgyDone(quota, credits, email, missing)));
             });
@@ -1656,7 +1659,8 @@ namespace AiLimitWidget
             agyFetching = false;
             UpdateSpin();
             agyNextFetch = DateTime.Now.AddMinutes(1);
-            if (agyUpdatedAt == null) SetAgyStatus("Нет сети — повторю через минуту", false);
+            SetAgyStatus(OfflineText, false);
+            GoneOffline();
             UpdateView();
         }
 
@@ -2011,6 +2015,21 @@ namespace AiLimitWidget
                 ExtraResult r;
                 try { r = Extra.Fetch(x.Key); }
                 catch (Exception) { r = new ExtraResult { Problem = "Нет соединения — повторю позже" }; }
+                // без сети ответ «входа нет» или ошибка ничего не значат — раздел не прячем, ждём сеть
+                if ((!r.SignedIn || r.Problem != null) && !NetUp())
+                {
+                    dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        x.Fetching = false;
+                        x.NextFetch = DateTime.Now.AddMinutes(1);
+                        GoneOffline();
+                        x.Status = OfflineText;
+                        x.StatusIsError = false;
+                        UpdateSpin();
+                        UpdateView();
+                    }));
+                    return;
+                }
                 dispatcher.BeginInvoke(new Action(() => FetchExtraDone(x, r)));
             });
         }
@@ -2301,9 +2320,56 @@ namespace AiLimitWidget
         DateTime hiddenAt = DateTime.MinValue;
         DateTime startDelayUntil = DateTime.MinValue;   // сразу после включения ПК ничего не запускаем — Windows и так загружена
 
+        // Без интернета никого не спрашиваем: ни запросов, ни команд CLI, ни проверок входа —
+        // иначе сервисы решают, что входа нет, и просят войти заново. Старые данные остаются на месте.
+        // Сеть проверяем в фоне раз в 5 с; появилась — сразу обновляем всё.
+        bool online, netKnown;   // до первой проверки считаем, что сети нет
+        int netChecking;
+        DateTime netCheckAt = DateTime.MinValue;
+
+        void WatchNet()
+        {
+            if (DateTime.Now < netCheckAt || Interlocked.CompareExchange(ref netChecking, 1, 0) != 0) return;
+            netCheckAt = DateTime.Now.AddSeconds(5);
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                bool up = NetUp();
+                dispatcher.BeginInvoke(new Action(() =>
+                {
+                    netChecking = 0;
+                    bool was = online, first = !netKnown;
+                    online = up;
+                    netKnown = true;
+                    if (!up && (was || first)) ShowOffline();
+                    if (up && !was && DateTime.Now >= startDelayUntil) FetchAll();
+                    UpdateView();
+                }));
+            });
+        }
+
+        const string OfflineText = "Нет сети — обновлю, когда появится интернет";
+
+        // запрос сам заметил, что сети нет (раньше фоновой проверки) — останавливаем всех до её возвращения
+        void GoneOffline()
+        {
+            if (!online) return;
+            online = false;
+            ShowOffline();
+            netCheckAt = DateTime.Now.AddSeconds(5);
+        }
+
+        void ShowOffline()
+        {
+            SetStatus(OfflineText, false);
+            SetAgyStatus(OfflineText, false);
+            SetCodexStatus(OfflineText, false);
+            foreach (var x in extras) { x.Status = OfflineText; x.StatusIsError = false; }
+        }
+
         void Tick()
         {
-            if (DateTime.Now < startDelayUntil) { UpdateView(); return; }
+            WatchNet();
+            if (DateTime.Now < startDelayUntil || !online) { UpdateView(); return; }
             // окно лимита закончилось — сразу спрашиваем новые данные
             bool expired = session != null && session.ResetsAt.HasValue && session.ResetsAt.Value <= DateTime.Now;
             if (!fetching && (DateTime.Now >= nextFetch || (expired && DateTime.Now >= nextFetch.AddMinutes(-settings.RefreshMinutes).AddSeconds(20))))

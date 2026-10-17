@@ -1610,7 +1610,11 @@ namespace AiLimitWidget
             agyUpdateCheck = DateTime.Now;
             ThreadPool.QueueUserWorkItem(_ =>
             {
-                try { Background.Run(AgyExe, "update", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 600000); }
+                try
+                {
+                    if (NetUp()) Background.Run(AgyExe, "update", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 600000);
+                    else agyUpdateCheck = DateTime.MinValue;   // без сети — попробуем в следующий раз
+                }
                 catch (Exception) { }
                 finally { agyUpdating = 0; }
             });
@@ -1628,6 +1632,7 @@ namespace AiLimitWidget
             SetSpin(true);
             ThreadPool.QueueUserWorkItem(_ =>
             {
+                if (!NetUp()) { dispatcher.BeginInvoke(new Action(AgyOffline)); return; }
                 bool missing;
                 string quota = RunAgy("/quota", out missing);
                 bool ignored;
@@ -1635,6 +1640,24 @@ namespace AiLimitWidget
                 string email = ReadAgyEmail();
                 dispatcher.BeginInvoke(new Action(() => FetchAgyDone(quota, credits, email, missing)));
             });
+        }
+
+        // Есть ли интернет: после включения или выхода из сна сеть появляется не сразу.
+        // Без сети agy считает, что входа нет, и просит войти заново — поэтому без сети его не запускаем.
+        static bool NetUp()
+        {
+            try { return System.Net.Dns.GetHostAddresses("oauth2.googleapis.com").Length > 0; }
+            catch (Exception) { return false; }
+        }
+
+        // сети пока нет: старые данные оставляем, повторяем через минуту
+        void AgyOffline()
+        {
+            agyFetching = false;
+            UpdateSpin();
+            agyNextFetch = DateTime.Now.AddMinutes(1);
+            if (agyUpdatedAt == null) SetAgyStatus("Нет сети — повторю через минуту", false);
+            UpdateView();
         }
 
         void FetchAgyDone(string quota, string credits, string email, bool missing)
@@ -3460,18 +3483,16 @@ namespace AiLimitWidget
         // env — добавить переменные окружения; Win32Exception — программа не найдена
         public static string Run(string exe, string args, string dir, int timeoutMs, IDictionary<string, string> env = null)
         {
-            IntPtr block = IntPtr.Zero;
-            int flags = 0x08000000;   // CREATE_NO_WINDOW
-            if (env != null)
-            {
-                var all = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables()) all[(string)e.Key] = (string)e.Value;
-                foreach (var e in env) all[e.Key] = e.Value;
-                var sb = new StringBuilder();
-                foreach (var e in all) sb.Append(e.Key).Append('=').Append(e.Value).Append('\0');
-                block = Marshal.StringToHGlobalUni(sb.Append('\0').ToString());
-                flags |= 0x400;   // CREATE_UNICODE_ENVIRONMENT
-            }
+            int flags = 0x08000000 | 0x400;   // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+            var all = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables()) all[(string)e.Key] = (string)e.Value;
+            // всё, что виджет запускает, работает в фоне: окна входа в браузере не открываются
+            // (CLI, которые смотрят на BROWSER, вызовут пустую команду вместо браузера)
+            all["BROWSER"] = "cmd /c rem";
+            if (env != null) foreach (var e in env) all[e.Key] = e.Value;
+            var sb = new StringBuilder();
+            foreach (var e in all) sb.Append(e.Key).Append('=').Append(e.Value).Append('\0');
+            IntPtr block = Marshal.StringToHGlobalUni(sb.Append('\0').ToString());
             try { return Run(exe, args, dir, timeoutMs, block, flags); }
             finally { if (block != IntPtr.Zero) Marshal.FreeHGlobal(block); }
         }

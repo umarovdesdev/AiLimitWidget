@@ -1028,7 +1028,7 @@ namespace AiLimitWidget
         [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hwnd, int index);
         [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr hwnd, int index, int value);
-        static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        static readonly IntPtr HWND_TOP = IntPtr.Zero;
         const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOREDRAW = 0x8, SWP_NOACTIVATE = 0x10, SWP_NOOWNERZORDER = 0x200;
         const int GWL_EXSTYLE = -20, WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000, WS_EX_TRANSPARENT = 0x20;
         const double ChevronOverlap = -7.8;   // надпись заходит на пустое поле кнопки ^ (клики проходят насквозь)
@@ -1077,24 +1077,39 @@ namespace AiLimitWidget
         void InitClockLabel()
         {
             // почти прозрачный фон — чтобы по надписи можно было нажать
-            var box = clockBox = new Border { Padding = new Thickness(8, 3, 0, 3), Child = BuildClockGrid() };
-            clock = new Window {
-                WindowStyle = WindowStyle.None, AllowsTransparency = true, Background = Brushes.Transparent, ResizeMode = ResizeMode.NoResize,
-                ShowInTaskbar = false, ShowActivated = false, Topmost = true, SizeToContent = SizeToContent.WidthAndHeight,
-                FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI"), Content = box, Title = "AI limits" };
-            TextOptions.SetTextFormattingMode(clock, TextFormattingMode.Display);
-            clock.SourceInitialized += (s, e) =>
-            {
-                IntPtr hwnd = new WindowInteropHelper(clock).Handle;
-                // надпись только показывает проценты: мышь её «не видит», клики уходят панели задач
-                SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT);
-            };
-            clock.SizeChanged += (s, e) => PlaceClockLabel();
+            clockBox = new Border { Padding = new Thickness(8, 3, 0, 3), Child = BuildClockGrid() };
+            CreateClockWindow();
 
             // надпись пропускает мышь насквозь, поэтому наведение узнаём по положению курсора
             hoverTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(120) };
             hoverTimer.Tick += (s, e) => CheckHover();
             hoverTimer.Start();
+        }
+
+        void CreateClockWindow()
+        {
+            var w = new Window {
+                WindowStyle = WindowStyle.None, AllowsTransparency = true, Background = Brushes.Transparent, ResizeMode = ResizeMode.NoResize,
+                ShowInTaskbar = false, ShowActivated = false, SizeToContent = SizeToContent.WidthAndHeight,
+                FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI"), Content = clockBox, Title = "AI limits" };
+            TextOptions.SetTextFormattingMode(w, TextFormattingMode.Display);
+            w.SourceInitialized += (s, e) =>
+            {
+                IntPtr hwnd = new WindowInteropHelper(w).Handle;
+                // надпись только показывает проценты: мышь её «не видит», клики уходят панели задач
+                SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT);
+            };
+            w.SizeChanged += (s, e) => PlaceClockLabel();
+            // перезапустился проводник — панель задач закрылась вместе с надписью внутри; создаём надпись заново
+            w.Closed += (s, e) =>
+            {
+                if (clock != w || exiting) return;
+                w.Content = null;
+                clockOwner = IntPtr.Zero;
+                CreateClockWindow();
+                Dispatcher.CurrentDispatcher.BeginInvoke(new Action(PlaceClockLabel), DispatcherPriority.Background);
+            };
+            clock = w;
         }
 
         static bool TaskbarLightTheme
@@ -1256,18 +1271,22 @@ namespace AiLimitWidget
             if (current == null || current.Color != color) block.Foreground = B(color);
         }
 
-        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr64(IntPtr hwnd, int index, IntPtr value);
-        [DllImport("user32.dll", EntryPoint = "SetWindowLongW")] static extern int SetWindowLong32(IntPtr hwnd, int index, int value);
-        const int GWLP_HWNDPARENT = -8;
         IntPtr clockOwner = IntPtr.Zero;
+        bool exiting;
 
-        // Владелец надписи — панель задач: Windows всегда держит окно над его владельцем,
-        // поэтому нажатие на панель задач больше не прячет надпись (раньше она мигала до следующей секунды)
-        void OwnByTaskbar(IntPtr hwnd, IntPtr bar)
+        [DllImport("user32.dll")] static extern IntPtr SetParent(IntPtr child, IntPtr parent);
+        const int GWL_STYLE = -16, WS_CHILD = 0x40000000;
+        const uint WS_POPUP = 0x80000000;
+
+        // Надпись — дочернее окно самой панели задач. Когда открыт «Пуск», поиск или меню трея,
+        // Windows поднимает панель задач в системный слой выше всех окон (даже «поверх всех»),
+        // и отдельное окно оказывалось под ней — надпись пропадала, пока меню не закроют.
+        // Дочернее окно поднимается вместе с панелью и видно всегда.
+        void EmbedInTaskbar(IntPtr hwnd, IntPtr bar)
         {
             if (hwnd == IntPtr.Zero || bar == clockOwner) return;
-            if (IntPtr.Size == 8) SetWindowLongPtr64(hwnd, GWLP_HWNDPARENT, bar);
-            else SetWindowLong32(hwnd, GWLP_HWNDPARENT, bar.ToInt32());
+            SetWindowLong(hwnd, GWL_STYLE, (int)((uint)GetWindowLong(hwnd, GWL_STYLE) & ~WS_POPUP) | WS_CHILD);
+            SetParent(hwnd, bar);
             clockOwner = bar;
         }
 
@@ -1286,14 +1305,15 @@ namespace AiLimitWidget
                 if (ok)
                 {
                     IntPtr hwnd = new WindowInteropHelper(clock).EnsureHandle();
-                    OwnByTaskbar(hwnd, bar);
+                    EmbedInTaskbar(hwnd, bar);
                     var source = PresentationSource.FromVisual(clock);
                     double scale = source != null && source.CompositionTarget != null ? source.CompositionTarget.TransformToDevice.M11 : 1;
                     int labelWidthPx = (int)(clock.ActualWidth * scale);
                     int labelHeightPx = (int)(clock.ActualHeight * scale);
                     int x = (int)(nr.Left - labelWidthPx + ChevronOverlap * scale);
                     int y = (tb.Top + tb.Bottom) / 2 - labelHeightPx / 2;
-                    SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER);
+                    // координаты дочернего окна — от левого верхнего угла панели задач
+                    SetWindowPos(hwnd, HWND_TOP, x - tb.Left, y - tb.Top, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER);
                     if (!clock.IsVisible) clock.Show();
                     return;
                 }
@@ -3452,6 +3472,7 @@ namespace AiLimitWidget
 
         void Exit()
         {
+            exiting = true;
             timer.Stop();
             tray.Visible = false;
             tray.Dispose();

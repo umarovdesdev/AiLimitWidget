@@ -519,7 +519,7 @@ enum Extra {
                 registerAccount(key, label, lighten(aiColor(svc)), [svc, dir, "\(n)"], &active, &found)
             }
         }
-        let live = AgyAccounts.isAdding ? mainAgyEmail : (AgyAccounts.liveEmail() ?? mainAgyEmail)
+        let live = AgyAccounts.isAdding ? mainAgyEmail : (AgyAccounts.mainEmail() ?? mainAgyEmail)
         for email in AgyAccounts.saved() {
             if email.isEmpty || (live != nil && email.caseInsensitiveCompare(live!) == .orderedSame) { continue }
             let id = cleanId(email)
@@ -1189,6 +1189,15 @@ enum AgyAccounts {
     }
 
     static func liveEmail() -> String? { email(read(live)) }
+
+    // почта основного входа: пока ace (или виджет) подставил вход другого аккаунта, прежняя почта лежит в account.restore —
+    // иначе на время задачи ace подставленный аккаунт сочли бы основным и его раздел пропал бы
+    static func mainEmail() -> String? {
+        if let e = (try? String(contentsOfFile: mark, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines), !e.isEmpty {
+            return e
+        }
+        return liveEmail()
+    }
 
     static func remove(_ email: String) {
         let (service, account) = split(prefix + email)

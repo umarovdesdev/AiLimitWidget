@@ -43,6 +43,18 @@ enum J {
         guard let t = text(obj) else { return }
         try? t.write(toFile: path, atomically: true, encoding: .utf8)
     }
+    // файл с токенами: временный файл сразу 0600 (O_EXCL), затем атомарная замена — читать может только владелец
+    static func writeSecret(_ obj: Any, _ path: String) {
+        guard let t = text(obj) else { return }
+        let tmp = path + ".tmp-\(getpid())"
+        Darwin.unlink(tmp)
+        let fd = Darwin.open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else { return }
+        let bytes = Array(t.utf8)
+        let ok = bytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) } == bytes.count
+        Darwin.close(fd)
+        if !ok || Darwin.rename(tmp, path) != 0 { Darwin.unlink(tmp) }
+    }
 }
 
 enum Fmt {

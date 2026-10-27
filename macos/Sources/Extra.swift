@@ -183,6 +183,33 @@ enum Extra {
         return nil
     }
 
+    // обновлённый вход Claude Code, взятый из связки ключей, — туда же, а не в файл; секрет через stdin (security -i), в hex (-X)
+    static func writeClaudeKeychain(_ dir: String, _ d: JSON) {
+        guard let t = J.text(d) else { return }
+        let svc = claudeKeychainService(dir)
+        let meta = Proc.run("/usr/bin/security", ["find-generic-password", "-s", svc], timeout: 10).output ?? ""
+        var acct = NSUserName()
+        if let line = meta.components(separatedBy: "\n").first(where: { $0.contains("\"acct\"<blob>=\"") }),
+           let r = line.range(of: "\"acct\"<blob>=\"") {
+            acct = String(line[r.upperBound...].dropLast())
+        }
+        let hex = Data(t.utf8).map { String(format: "%02x", $0) }.joined()
+        let cmd = "add-generic-password -U -s \"\(svc)\" -a \"\(acct)\" -X \(hex)\n"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["-i"]
+        let inp = Pipe()
+        p.standardInput = inp
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            inp.fileHandleForWriting.write(Data(cmd.utf8))
+            try? inp.fileHandleForWriting.close()
+            p.waitUntilExit()
+        } catch {}
+    }
+
     static func hasCreds(_ svc: String, _ dir: String) -> Bool {
         let cred = credFile(svc, dir)
         if FileManager.default.fileExists(atPath: cred) { return true }
@@ -669,7 +696,7 @@ enum Extra {
                 oauth["expiresAt"] = Int64((Date().timeIntervalSince1970 + expIn) * 1000)
             }
             d["claudeAiOauth"] = oauth
-            J.write(d, credPath)
+            if creds.fromKeychain { writeClaudeKeychain(dir, d) } else { J.writeSecret(d, credPath) }
         }
         let (code, text) = http(Widget.usageUrl, headers: [
             "Authorization": "Bearer " + token,
@@ -742,7 +769,7 @@ enum Extra {
             if let nr = J.string(rd?["refresh_token"]), !nr.isEmpty { tokens["refresh_token"] = nr }
             d["tokens"] = tokens
             d["last_refresh"] = Fmt.isoString(Date())
-            J.write(d, authPath)
+            J.writeSecret(d, authPath)
             return codexExtra(key, dir, retried: true)
         }
         guard (200..<300).contains(code), let u = J.obj(text) else {
@@ -873,7 +900,7 @@ enum Extra {
                     if let ni = J.string(d["id_token"]), !ni.isEmpty { creds["id_token"] = ni }
                     let expIn = J.double(d["expires_in"]) ?? 3600
                     creds["expiry_date"] = Int64((Date().timeIntervalSince1970 + expIn) * 1000)
-                    J.write(creds, credPath)
+                    J.writeSecret(creds, credPath)
                 } else {
                     geminiToken = (t, Date().addingTimeInterval(J.double(d["expires_in"]) ?? 3000))
                 }

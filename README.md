@@ -40,6 +40,10 @@
 | GitHub Copilot | Copilot CLI (связка ключей `copilot-cli` или `~/.copilot`), плагин Copilot (`~/.config/github-copilot`) или `gh auth token`; месячные лимиты | Copilot CLI (диспетчер учётных данных или `%USERPROFILE%\.copilot`), плагин Copilot (`%LOCALAPPDATA%\github-copilot`) или `gh auth token` |
 | Cursor | `~/Library/Application Support/Cursor/…/state.vscdb`; расход за месяц подписки | `%APPDATA%\Cursor\User\globalStorage\state.vscdb` (читается без sqlite3) |
 
+Несколько аккаунтов Antigravity (Windows): если в скилле ace (`~/.claude/skills/ace/config.json`) сохранены входы аккаунтов,
+виджет берёт лимиты всех аккаунтов через `ace widget` и показывает их в разделе Antigravity — «Аккаунт 1», «Аккаунт 2»…;
+у второго и следующих аккаунтов цвета групп светлее, у часов — свои столбцы.
+
 Новые лимиты внутри этих сервисов (группы Antigravity вроде Gemini 4 Argon, лимиты Claude, Codex, Copilot) появляются сами — и на macOS, и на Windows.
 
 ### Свой ИИ без пересборки

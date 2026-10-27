@@ -65,6 +65,8 @@ namespace AiLimitWidget
     sealed class AgyGroup
     {
         public string Key, Title, Models;
+        public string Name;       // название без номера аккаунта — для строки под заголовком «Аккаунт N»
+        public int Account = 1;   // аккаунт Antigravity (несколько входов через ace); у второго ключ «gemini@2»
         public Limit Session, Week;
         public bool SessionOff;   // 5-часовое окно отключено сервисом (упёрлись в недельный лимит)
 
@@ -908,6 +910,13 @@ namespace AiLimitWidget
 
         static Color GroupColor(string key)
         {
+            // группы второго и следующих аккаунтов Antigravity — тот же цвет, только светлее
+            int at = (key ?? "").IndexOf('@');
+            if (at > 0)
+            {
+                Color c = GroupColor(key.Substring(0, at));
+                return Color.FromRgb((byte)(c.R + (255 - c.R) * 0.45), (byte)(c.G + (255 - c.G) * 0.45), (byte)(c.B + (255 - c.B) * 0.45));
+            }
             switch (key)
             {
                 case "claude": return Accent;
@@ -979,6 +988,8 @@ namespace AiLimitWidget
         bool agyNoAuth;   // agy есть, но входа в нём нет — раздел прячем
         bool agyChecked;  // agy уже хоть раз ответил (или не нашёлся)
         double? agyCredits;
+        // второй и следующие аккаунты Antigravity (входы, сохранённые в ace): { название, почта, ответ /quota, ответ /credits }
+        readonly List<string[]> agyExtra = new List<string[]>();
         DateTime? agyUpdatedAt;
         DateTime agyNextFetch = DateTime.MinValue;
         readonly Settings settings = new Settings();
@@ -1654,15 +1665,69 @@ namespace AiLimitWidget
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 if (!NetUp()) { dispatcher.BeginInvoke(new Action(AgyOffline)); return; }
-                bool missing;
-                string quota = RunAgy("/quota", out missing);
-                bool ignored;
-                string credits = quota == null ? null : RunAgy("/credits", out ignored);
+                bool missing = false;
+                string quota = null, credits = null, aceEmail = null;
+                List<string[]> extra = null;
+                string ace = AceAccounts ? RunAce() : null;
+                if (ace == null || !ParseAce(ace, out quota, out credits, out aceEmail, out extra))
+                {
+                    extra = null;
+                    quota = RunAgy("/quota", out missing);
+                    bool ignored;
+                    credits = quota == null ? null : RunAgy("/credits", out ignored);
+                }
                 // сеть пропала, пока agy работал, — его «нет входа» не верим
                 if (!missing && !NetUp()) { dispatcher.BeginInvoke(new Action(AgyOffline)); return; }
-                string email = ReadAgyEmail();
-                dispatcher.BeginInvoke(new Action(() => FetchAgyDone(quota, credits, email, missing)));
+                string email = aceEmail ?? ReadAgyEmail();
+                dispatcher.BeginInvoke(new Action(() => FetchAgyDone(quota, credits, email, missing, extra)));
             });
+        }
+
+        // Несколько аккаунтов Antigravity: agy хранит вход в диспетчере учётных данных Windows — один на пользователя.
+        // Скилл ace (~/.claude/skills/ace) сохраняет входы аккаунтов и подставляет нужный на время запроса, поэтому
+        // при аккаунтах в его config.json лимиты всех аккаунтов берём через «ace widget» (тоже /quota, 0 токенов).
+        static string AceScript { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "skills", "ace", "bin", "ace"); } }
+
+        static bool AceAccounts
+        {
+            get
+            {
+                try
+                {
+                    string cfg = Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(AceScript)), "config.json");
+                    return File.Exists(AceScript) && File.Exists(cfg) && File.ReadAllText(cfg).Contains("\"account\"");
+                }
+                catch (Exception) { return false; }
+            }
+        }
+
+        static string RunAce()
+        {
+            var env = new Dictionary<string, string> { { "AGY_CLI_DISABLE_AUTO_UPDATE", "true" }, { "PYTHONIOENCODING", "utf-8" } };
+            foreach (string py in new[] { "python", "py" })
+                try { return Background.Run(py, "\"" + AceScript + "\" widget", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 180000, env); }
+                catch (System.ComponentModel.Win32Exception) { }   // нет такой команды — пробуем следующую
+                catch (Exception) { return null; }
+            return null;
+        }
+
+        // ответ «ace widget»: { "accounts": [ { "label", "email", "quota", "credits", "busy" }, … ] } — первый аккаунт основной
+        bool ParseAce(string text, out string quota, out string credits, out string email, out List<string[]> extra)
+        {
+            quota = credits = email = null;
+            extra = new List<string[]>();
+            try
+            {
+                var list = (Get(json.DeserializeObject(text) as Dictionary<string, object>, "accounts") as System.Collections.IEnumerable)
+                    .OfType<Dictionary<string, object>>().ToList();
+                if (list.Count == 0) return false;
+                Func<Dictionary<string, object>, string, string> str = (a, k) => Convert.ToString(Get(a, k), Inv);
+                quota = str(list[0], "quota"); credits = str(list[0], "credits"); email = str(list[0], "email");
+                if (string.IsNullOrEmpty(email)) email = null;
+                foreach (var a in list.Skip(1)) extra.Add(new[] { str(a, "label"), str(a, "email"), str(a, "quota"), str(a, "credits") });
+                return !string.IsNullOrEmpty(quota);
+            }
+            catch (Exception) { return false; }
         }
 
         // Есть ли интернет: после включения или выхода из сна сеть появляется не сразу.
@@ -1684,8 +1749,9 @@ namespace AiLimitWidget
             UpdateView();
         }
 
-        void FetchAgyDone(string quota, string credits, string email, bool missing)
+        void FetchAgyDone(string quota, string credits, string email, bool missing, List<string[]> extra)
         {
+            if (extra != null) { agyExtra.Clear(); agyExtra.AddRange(extra); }
             agyFetching = false;
             UpdateSpin();
             agyMissing = missing;
@@ -1703,7 +1769,7 @@ namespace AiLimitWidget
                 try
                 {
                     File.WriteAllText(agyCachePath, json.Serialize(new Dictionary<string, object> {
-                        { "At", agyUpdatedAt.Value.ToString("o", Inv) }, { "Body", quota }, { "Credits", credits }, { "Email", agyEmail } }), new UTF8Encoding(false));
+                        { "At", agyUpdatedAt.Value.ToString("o", Inv) }, { "Body", quota }, { "Credits", credits }, { "Email", agyEmail }, { "Extra", agyExtra } }), new UTF8Encoding(false));
                 }
                 catch (Exception) { }
                 CheckNotifications();
@@ -1726,23 +1792,40 @@ namespace AiLimitWidget
             return (name ?? key).Replace(" Models", "").Replace(" models", "").Replace(" and ", " и ");
         }
 
+        // все аккаунты: основной и agyExtra; у второго и следующих ключи групп с «@N»
         bool ParseAgy(string text, out string problem)
+        {
+            var list = AgyGroupsOf(text, 1, out problem);
+            if (list == null) return false;
+            for (int i = 0; i < agyExtra.Count; i++)
+            {
+                string ignored;
+                var more = AgyGroupsOf(agyExtra[i][2], i + 2, out ignored);
+                if (more != null) list.AddRange(more);
+            }
+            agyGroups.Clear();
+            agyGroups.AddRange(list);
+            RememberAgyKeys();
+            return true;
+        }
+
+        List<AgyGroup> AgyGroupsOf(string text, int account, out string problem)
         {
             problem = null;
             try
             {
                 var d = json.DeserializeObject(text) as Dictionary<string, object>;
-                if (d == null) return false;
+                if (d == null) return null;
                 if (Convert.ToString(Get(d, "status"), Inv) != "SUCCESS")
                 {
                     string r = Convert.ToString(Get(d, "response") ?? Get(d, "error"), Inv) ?? "";
                     problem = r.IndexOf("sign", StringComparison.OrdinalIgnoreCase) >= 0 || r.IndexOf("auth", StringComparison.OrdinalIgnoreCase) >= 0
                         ? AgyNoAuthText : "Antigravity вернул ошибку";
-                    return false;
+                    return null;
                 }
                 var data = Get(Get(d, "command") as Dictionary<string, object>, "data") as Dictionary<string, object>;
                 var groups = Get(data, "groups") as System.Collections.IEnumerable;
-                if (groups == null) { problem = "Antigravity не сообщил лимиты"; return false; }
+                if (groups == null) { problem = "Antigravity не сообщил лимиты"; return null; }
                 var list = new List<AgyGroup>();
                 foreach (var gr in groups.OfType<Dictionary<string, object>>())
                 {
@@ -1770,29 +1853,44 @@ namespace AiLimitWidget
                         else if (window == "weekly") { l.Title = "Неделя"; g.Week = l; }
                     }
                     if (g.Key == null) g.Key = Convert.ToString(Get(gr, "name"), Inv);
-                    g.Title = AgyTitle(g.Key, Convert.ToString(Get(gr, "name"), Inv));
+                    g.Title = g.Name = AgyTitle(g.Key, Convert.ToString(Get(gr, "name"), Inv));
+                    g.Account = account;
+                    if (agyExtra.Count > 0) g.Title += " · акк. " + account;
+                    if (account > 1) g.Key += "@" + account;
                     if (g.Session != null) g.Session.Title = g.Title + " · 5 ч";
                     if (g.Week != null) g.Week.Title = g.Title + " · неделя";
                     list.Add(g);
                 }
-                agyGroups.Clear();
-                agyGroups.AddRange(list);
-                RememberAgyKeys();
-                return true;
+                return list;
             }
-            catch (Exception) { return false; }
+            catch (Exception) { return null; }
         }
 
         void ParseAgyCredits(string text)
+        {
+            double? c = CreditsOf(text);
+            if (c.HasValue) agyCredits = c;
+        }
+
+        double? CreditsOf(string text)
         {
             try
             {
                 var d = text == null ? null : json.DeserializeObject(text) as Dictionary<string, object>;
                 var data = Get(Get(d, "command") as Dictionary<string, object>, "data") as Dictionary<string, object>;
                 object c = Get(data, "remaining_credits");
-                if (c != null) agyCredits = Convert.ToDouble(c, Inv);
+                return c == null ? (double?)null : Convert.ToDouble(c, Inv);
             }
-            catch (Exception) { }
+            catch (Exception) { return null; }
+        }
+
+        // строка над группами аккаунта, когда аккаунтов несколько: «Аккаунт 2 · почта · кредиты: 50»
+        string AgyAccountLine(int account)
+        {
+            string email = account == 1 ? agyEmail : agyExtra[account - 2][1];
+            double? credits = account == 1 ? null : CreditsOf(agyExtra[account - 2][3]);
+            return string.Join(" · ", new[] { "Аккаунт " + account, email,
+                credits.HasValue && credits.Value > 0 ? "кредиты: " + Math.Round(credits.Value) : null }.Where(x => !string.IsNullOrEmpty(x)));
         }
 
         // почту Antigravity пишет в свой журнал при входе: «applyAuthResult: email=…»
@@ -1819,6 +1917,10 @@ namespace AiLimitWidget
             {
                 if (!File.Exists(agyCachePath)) return;
                 var d = json.DeserializeObject(File.ReadAllText(agyCachePath, Encoding.UTF8)) as Dictionary<string, object>;
+                var extra = Get(d, "Extra") as System.Collections.IEnumerable;
+                if (extra != null)
+                    foreach (var x in extra.OfType<System.Collections.IEnumerable>())
+                        agyExtra.Add(x.Cast<object>().Select(v => Convert.ToString(v, Inv)).ToArray());
                 string problem;
                 if (ParseAgy(Convert.ToString(Get(d, "Body"), Inv), out problem))
                     agyUpdatedAt = DateTime.Parse(Convert.ToString(Get(d, "At"), Inv), Inv, DateTimeStyles.RoundtripKind);
@@ -2475,7 +2577,16 @@ namespace AiLimitWidget
                     rows.Children.Add(ProviderHeader("Antigravity", agyColors, credits, rows.Children.Count == 0));
                     if (agyGroups.Count == 0 && string.IsNullOrEmpty(agyStatus))
                         rows.Children.Add(Hint("Загрузка…"));
-                    foreach (var g in agyGroups) rows.Children.Add(AgyRow(g, now));
+                    int shownAccount = 0;
+                    foreach (var g in agyGroups)
+                    {
+                        if (agyExtra.Count > 0 && g.Account != shownAccount && g.Account - 2 < agyExtra.Count)
+                        {
+                            shownAccount = g.Account;
+                            rows.Children.Add(Hint(AgyAccountLine(g.Account)));
+                        }
+                        rows.Children.Add(AgyRow(g, now));
+                    }
                     if (!string.IsNullOrEmpty(agyStatus)) rows.Children.Add(StatusLine(agyStatus, agyStatusIsError));
                 }
                 if (CodexOn)
@@ -2581,7 +2692,7 @@ namespace AiLimitWidget
             head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             head.ColumnDefinitions.Add(new ColumnDefinition());
             head.Children.Add(Dot(color, 6, new Thickness(0, 1, 6, 0)));
-            var title = new TextBlock { Text = g.Title, FontSize = 12.5, Foreground = B("#D1D1D6") };
+            var title = new TextBlock { Text = agyExtra.Count > 0 ? g.Name ?? g.Title : g.Title, FontSize = 12.5, Foreground = B("#D1D1D6") };
             Grid.SetColumn(title, 1);
             head.Children.Add(title);
             if (!string.IsNullOrEmpty(g.Models))
@@ -2710,7 +2821,10 @@ namespace AiLimitWidget
             bool claudeOn = ClaudeOn, agyOn = AgyOn, codexOn = CodexOn;
             var accounts = new List<Tuple<Color, string, string, string>>();   // цвет, сервис, почта, тариф
             if (claudeOn) accounts.Add(Tuple.Create(Accent, "Claude Code", Acc("emailAddress"), plan.Length > 0 ? "Claude " + plan : null));
-            if (agyOn) accounts.Add(Tuple.Create(GeminiColor, "Antigravity", agyEmail, (string)null));
+            if (agyOn) accounts.Add(Tuple.Create(GeminiColor, agyExtra.Count > 0 ? "Antigravity 1" : "Antigravity", agyEmail, (string)null));
+            if (agyOn)
+                for (int i = 0; i < agyExtra.Count; i++)
+                    accounts.Add(Tuple.Create(GroupColor("gemini@" + (i + 2)), "Antigravity " + (i + 2), agyExtra[i][1], (string)null));
             if (codexOn) accounts.Add(Tuple.Create(CodexColor, "Codex", codexEmail, codexPlan.Length > 0 ? "ChatGPT " + codexPlan : null));
             foreach (var x in ShownExtras) accounts.Add(Tuple.Create(x.Color, x.Name, x.Email, x.Plan.Length > 0 ? x.Plan : null));
             var emails = accounts.Select(a => a.Item3).Where(e => !string.IsNullOrEmpty(e)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
@@ -2957,7 +3071,7 @@ namespace AiLimitWidget
             if (settings.ShowClaude && session != null) tip.Add("Claude " + Math.Round(pct) + "%" + (weekly.Count > 0 ? " (нед. " + Math.Round(Current(weekly[0], now)) + "%)" : ""));
             if (settings.ShowAgy)
                 foreach (var gr in agyGroups)
-                    tip.Add((gr.Key == "3p" ? "Claude/GPT" : gr.Title) + " " + Math.Round(Current(gr.Short, now)) + "%");
+                    tip.Add((gr.Key.StartsWith("3p") ? "Claude/GPT" : gr.Name ?? gr.Title) + (gr.Account > 1 ? " #" + gr.Account : "") + " " + Math.Round(Current(gr.Short, now)) + "%");
             if (settings.ShowCodex && codexLimits.Count > 0) tip.Add("Codex " + Math.Round(Current(codexLimits[0], now)) + "%");
             foreach (var x in ShownExtras) if (x.Short != null) tip.Add(x.Name + " " + Math.Round(Current(x.Short, now)) + "%");
             string text63 = tip.Count == 0 ? "Лимиты ИИ" : string.Join(" · ", tip);
@@ -3323,6 +3437,7 @@ namespace AiLimitWidget
             else if (target == "agy")
             {
                 agyGroups.Clear();
+                agyExtra.Clear();
                 agyEmail = null;
                 agyCredits = null;
                 agyUpdatedAt = null;

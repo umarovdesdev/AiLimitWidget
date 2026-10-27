@@ -1,4 +1,4 @@
-// Виджет «Лимиты ИИ» для Windows 10 / 11 — лимиты Claude Code, Antigravity CLI, Codex и других ИИ (класс Extra) в одном окне.
+﻿// Виджет «Лимиты ИИ» для Windows 10 / 11 — лимиты Claude Code, Antigravity CLI, Codex и других ИИ (класс Extra) в одном окне.
 // Claude: те же данные, что /usage в Claude Code; токен из %USERPROFILE%\.claude\.credentials.json (только читаем).
 // Antigravity: «agy -p /quota --output-format json» — бесплатная команда, без обращения к модели и без расхода квоты.
 // Вырос из ClaudeLimitWidget. Сборка: build.cmd (компилятор C# из .NET Framework 4). Код на C# 5.
@@ -51,6 +51,7 @@ namespace AiLimitWidget
         public string AgyKeys = "gemini,3p";                       // группы Antigravity, которые уже встречались: новая (например, Gemini 4 Argon) сама получает столбец у часов
         public string HiddenExtras = "";                           // другие ИИ (Gemini CLI, Copilot, Cursor), которые выключили в «Показывать»
         public string LoggedOut = "";                              // сервисы, скрытые из-за выхода: вернутся сами, когда в них снова войдут
+        public readonly Dictionary<string, string> AccountNames = new Dictionary<string, string>();   // свои имена дополнительных аккаунтов («acc-…» → имя)
     }
 
     sealed class Limit
@@ -65,8 +66,6 @@ namespace AiLimitWidget
     sealed class AgyGroup
     {
         public string Key, Title, Models;
-        public string Name;       // название без номера аккаунта — для строки под заголовком «Аккаунт N»
-        public int Account = 1;   // аккаунт Antigravity (несколько входов через ace); у второго ключ «gemini@2»
         public Limit Session, Week;
         public bool SessionOff;   // 5-часовое окно отключено сервисом (упёрлись в недельный лимит)
 
@@ -192,21 +191,38 @@ namespace AiLimitWidget
         public Color Color;
         public readonly List<Limit> Limits = new List<Limit>();   // по возрастанию окна: у часов сверху — первый, снизу — последний
         public string Plan = "", Email, Status = "";
+        public string LongKey;                                      // лимит для нижней строки у часов (если не последний)
+        public List<AgyGroup> Groups;                               // Antigravity: группы — рисуем как в основном разделе
         public bool StatusIsError, SignedIn, Fetching;              // SignedIn — есть вход, раздел показываем
         public DateTime? UpdatedAt;
         public DateTime NextFetch = DateTime.MinValue;
 
         public Limit Short { get { return Limits.FirstOrDefault(); } }
-        public Limit Long { get { return Limits.Count > 1 ? Limits[Limits.Count - 1] : null; } }
+        public Limit Long
+        {
+            get
+            {
+                Limit l = LongKey == null ? null : Limits.FirstOrDefault(x => x.Key == LongKey);
+                return l ?? (Limits.Count > 1 ? Limits[Limits.Count - 1] : null);
+            }
+        }
     }
 
     // результат одного запроса: SignedIn = false — входа нет, раздел прячем
     sealed class ExtraResult
     {
-        public bool SignedIn = true;
+        public bool SignedIn = true, Confirmed;
         public readonly List<Limit> Limits = new List<Limit>();
-        public string Plan = "", Email, Problem;
+        public string Plan = "", Email, Problem, LongKey;
         public int RetryAfterSeconds;
+        public List<AgyGroup> Groups;   // Antigravity: группы моделей (5 часов + неделя рядом)
+        public bool Busy;   // вход занят (Antigravity: идёт задача ace или вход в новый аккаунт) — данные не трогаем, повторим через минуту
+    }
+
+    // описание того, как добавить дополнительный аккаунт ИИ (переменная окружения для папки и команда входа)
+    sealed class AccountSpec
+    {
+        public string Env, Login;
     }
 
     // Gemini CLI: вход из ~/.gemini/oauth_creds.json, лимиты — тот же запрос, что /stats в самом Gemini CLI.
@@ -222,35 +238,335 @@ namespace AiLimitWidget
             new[] { "cursor", "Cursor", "#40C8E0" }           // бирюзовый
         };
 
-        // ---------- ИИ из папки providers ----------
+        // ---------- ИИ из папки providers и дополнительные аккаунты ----------
         // %APPDATA%\AiLimitWidget\providers\<имя>.json: { "name": "Grok", "color": "#RRGGBB" (можно не указывать),
-        //   "command": "python", "args": "C:\\…\\grok.py", "timeout": 30 }
+        //   "command": "python", "args": "C:\\…\\grok.py", "timeout": 30,
+        //   "accounts": { "env": "GROK_HOME", "login": "grok login" } }
         // Команда печатает JSON: { "signed_in": true, "plan": "Pro", "email": "…", "problem": null,
         //   "limits": [ { "title": "Неделя", "percent": 12.5, "resets_at": "2026-10-20T10:00:00Z", "window_seconds": 604800 } ] }
         // percent — сколько израсходовано (0…100); вместо него можно remaining — сколько осталось (0…100).
         // Новый файл подхватывается на ходу: ИИ сам появляется в окне, в «Показывать» и у часов.
         static readonly Dictionary<string, Dictionary<string, object>> providers = new Dictionary<string, Dictionary<string, object>>();
+        // встроенная таблица описаний аккаунтов + провайдеры с блоком "accounts"
+        static readonly Dictionary<string, AccountSpec> BuiltinAccounts = new Dictionary<string, AccountSpec> {
+            { "claude", new AccountSpec { Env = "CLAUDE_CONFIG_DIR", Login = "claude auth login" } },
+            { "codex", new AccountSpec { Env = "CODEX_HOME", Login = "codex login" } },
+            { "geminicli", new AccountSpec { Env = "GEMINI_CLI_HOME", Login = "gemini" } }
+        };
+        static readonly Dictionary<string, AccountSpec> accountSpecs = new Dictionary<string, AccountSpec>(BuiltinAccounts);
+        // дополнительные аккаунты («acc-<svc>-<id>» → { svc, папка или почта, номер/id })
+        static readonly Dictionary<string, string[]> accounts = new Dictionary<string, string[]>();
+        static readonly Dictionary<string, string> customNames = new Dictionary<string, string>();
+        static readonly Dictionary<string, string> defaultLabels = new Dictionary<string, string>();
+        static readonly Dictionary<string, string> mainProviderEmails = new Dictionary<string, string>();
+        static readonly Dictionary<string, string> providerAccountEmails = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        static readonly HashSet<string> probingDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         static readonly string[] AutoColors = { "#FF6482", "#66D4CF", "#A8E05F", "#AC8E68", "#DA8FFF", "#FFB8A0" };
+        const string ExpiredAccountText = "Вход устарел — добавьте аккаунт заново";
+        public static string MainAgyEmail, LastDuplicateSvc, WaitingDir;
 
         public static string ProvidersDir
         {
             get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AiLimitWidget", "providers"); }
         }
 
-        // вызывается из окна (основной поток): возвращает только что найденные ИИ
+        public static string AccountsDir
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AiLimitWidget", "accounts"); }
+        }
+
+        public static bool IsBuiltinFolderSvc(string svc)
+        {
+            return svc == "claude" || svc == "codex" || svc == "geminicli";
+        }
+
+        public static AccountSpec AccountSpecFor(string svc)
+        {
+            AccountSpec spec;
+            lock (accountSpecs) accountSpecs.TryGetValue(svc ?? "", out spec);
+            return spec;
+        }
+
+        // список всех ИИ, у которых есть описание аккаунтов (встроенные + провайдеры с "accounts")
+        public static List<string[]> AccountAis(bool agyAvail)
+        {
+            var list = new List<string[]> {
+                new[] { "claude", "Claude Code", "#D97757" },
+                new[] { "codex", "Codex", "#FFD60A" }
+            };
+            if (agyAvail) list.Add(new[] { "agy", "Antigravity", "#34C759" });
+            list.Add(new[] { "geminicli", "Gemini CLI", "#8AB4F8" });
+            foreach (var e in All)
+            {
+                if (!e[0].StartsWith("p-", StringComparison.Ordinal)) continue;
+                bool has;
+                lock (accountSpecs) has = accountSpecs.ContainsKey(e[0]);
+                if (has) list.Add(new[] { e[0], e[1], e[2] });
+            }
+            return list;
+        }
+
+        public static string AiName(string svc)
+        {
+            if (svc == "claude") return "Claude Code";
+            if (svc == "codex") return "Codex";
+            if (svc == "agy") return "Antigravity";
+            if (svc == "geminicli") return "Gemini CLI";
+            var e = All.FirstOrDefault(x => x[0] == svc || x[0] == "p-" + svc);
+            return e != null ? e[1] : svc;
+        }
+
+        public static string AiColor(string svc)
+        {
+            if (svc == "claude") return "#D97757";
+            if (svc == "agy") return "#34C759";
+            if (svc == "codex") return "#FFD60A";
+            if (svc == "geminicli") return "#8AB4F8";
+            var e = All.FirstOrDefault(x => x[0] == svc || x[0] == "p-" + svc);
+            return e != null ? e[2] : "#8AB4F8";
+        }
+
+        // цвет дополнительного аккаунта — цвет основного ИИ, осветлённый на ~45% к белому
+        static string Lighten(string hex)
+        {
+            Color c = (Color)ColorConverter.ConvertFromString(hex);
+            byte r = (byte)(c.R + (255 - c.R) * 0.45);
+            byte g = (byte)(c.G + (255 - c.G) * 0.45);
+            byte b = (byte)(c.B + (255 - c.B) * 0.45);
+            return "#" + r.ToString("X2", Inv) + g.ToString("X2", Inv) + b.ToString("X2", Inv);
+        }
+
+        internal static string CredFile(string svc, string dir)
+        {
+            if (svc == "claude") return Path.Combine(dir, ".credentials.json");
+            if (svc == "codex") return Path.Combine(dir, "auth.json");
+            return Path.Combine(dir, ".gemini", "oauth_creds.json");
+        }
+
+        internal static string AccountEmail(string svc, string dir)
+        {
+            if (svc == "claude")
+                return Str(Get(Obj(File(Path.Combine(dir, ".claude.json")), "oauthAccount"), "emailAddress"));
+            if (svc == "codex")
+                return Str(Get(Claims(Str(Get(Obj(File(Path.Combine(dir, "auth.json")), "tokens"), "id_token"))), "email"));
+            if (svc == "geminicli")
+                return Str(Get(Claims(Str(Get(File(Path.Combine(dir, ".gemini", "oauth_creds.json")), "id_token"))), "email"));
+            string e;
+            lock (providerAccountEmails) providerAccountEmails.TryGetValue(dir, out e);
+            return e;
+        }
+
+        internal static string MainEmail(string svc)
+        {
+            if (svc == "claude")
+            {
+                string dir = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
+                string path = string.IsNullOrEmpty(dir) ? Path.Combine(Home, ".claude.json") : Path.Combine(dir, ".claude.json");
+                return Str(Get(Obj(File(path), "oauthAccount"), "emailAddress"));
+            }
+            if (svc == "codex")
+                return Str(Get(Claims(Str(Get(Obj(File(Widget.CodexAuthPath), "tokens"), "id_token"))), "email"));
+            if (svc == "geminicli")
+                return Str(Get(Claims(Str(Get(File(Path.Combine(GeminiDir, "oauth_creds.json")), "id_token"))), "email"));
+            string e;
+            lock (mainProviderEmails) mainProviderEmails.TryGetValue(svc ?? "", out e);
+            return e;
+        }
+
+        public static string CleanId(string s)
+        {
+            var sb = new StringBuilder();
+            foreach (char ch in s ?? "") sb.Append(char.IsLetterOrDigit(ch) ? char.ToLowerInvariant(ch) : '-');
+            return sb.ToString();
+        }
+
+        public static string AccountSvc(string key)
+        {
+            string[] info;
+            lock (accounts) accounts.TryGetValue(key, out info);
+            return info == null ? null : info[0];
+        }
+
+        public static string AccountPrefix(string key)
+        {
+            string[] info;
+            lock (accounts) accounts.TryGetValue(key, out info);
+            return info == null ? null : AiName(info[0]);
+        }
+
+        public static void SetCustomNames(IDictionary<string, string> names)
+        {
+            lock (customNames)
+            {
+                customNames.Clear();
+                if (names != null)
+                    foreach (var kv in names)
+                        if (!string.IsNullOrEmpty(kv.Key) && !string.IsNullOrEmpty(kv.Value))
+                            customNames[kv.Key] = kv.Value;
+            }
+        }
+
+        public static string GetCustomName(string key)
+        {
+            string name;
+            lock (customNames) customNames.TryGetValue(key ?? "", out name);
+            return name;
+        }
+
+        public static string GetDefaultLabel(string key)
+        {
+            string label;
+            lock (defaultLabels) defaultLabels.TryGetValue(key ?? "", out label);
+            return label;
+        }
+
+        public static string AccountTitle(string key, string fallbackLabel = null)
+        {
+            string prefix = AccountPrefix(key);
+            if (prefix == null) return fallbackLabel ?? key;
+            if (!string.IsNullOrEmpty(fallbackLabel))
+                lock (defaultLabels) defaultLabels[key] = fallbackLabel;
+            else
+                lock (defaultLabels) defaultLabels.TryGetValue(key, out fallbackLabel);
+            string custom = GetCustomName(key);
+            string suffix = !string.IsNullOrEmpty(custom) ? custom : (!string.IsNullOrEmpty(fallbackLabel) ? fallbackLabel : key);
+            return prefix + " · " + suffix;
+        }
+
+        // команда запуска CLI в терминале под папкой этого аккаунта (только когда известна переменная окружения env)
+        public static string TerminalCommand(string key)
+        {
+            string[] info;
+            lock (accounts) accounts.TryGetValue(key, out info);
+            if (info == null || info[0] == "agy") return null;
+            string svc = info[0], dir = info[1];
+            AccountSpec spec = AccountSpecFor(svc);
+            if (spec == null || string.IsNullOrEmpty(spec.Env)) return null;
+            string exe = LoginExe(svc, spec.Login);
+            if (string.IsNullOrEmpty(exe)) return null;
+            return "set " + spec.Env + "=" + dir + "&& " + exe;
+        }
+
+        static string LoginExe(string svc, string login)
+        {
+            if (!string.IsNullOrEmpty(login))
+            {
+                string s = login.Trim();
+                if (s.StartsWith("\"", StringComparison.Ordinal))
+                {
+                    int end = s.IndexOf('"', 1);
+                    if (end > 1) return s.Substring(0, end + 1);
+                }
+                int sp = s.IndexOf(' ');
+                return sp > 0 ? s.Substring(0, sp) : s;
+            }
+            Dictionary<string, object> def;
+            lock (providers) providers.TryGetValue(svc, out def);
+            return Str(Get(def, "command"));
+        }
+
+        // проверка папки, в которой сейчас ждём вход (вызывается из фонового потока раз в 5 с)
+        public static bool CheckWaitingFolder(string svc, string dir, int num, out string email, out bool duplicate)
+        {
+            email = null;
+            duplicate = false;
+            if (IsBuiltinFolderSvc(svc))
+            {
+                string cred = CredFile(svc, dir);
+                if (!System.IO.File.Exists(cred)) return false;
+                email = AccountEmail(svc, dir);
+                if (svc == "claude" && string.IsNullOrEmpty(email) && System.IO.File.GetLastWriteTime(cred) > DateTime.Now.AddSeconds(-4))
+                    return false;
+            }
+            else
+            {
+                Dictionary<string, object> def;
+                lock (providers) providers.TryGetValue(svc, out def);
+                if (def == null) return false;
+                var r = Provider("acc-" + svc + "-" + num.ToString(Inv), def, dir);
+                if (!r.Confirmed) return false;
+                email = r.Email;
+                if (string.IsNullOrEmpty(MainEmail(svc))) Provider(svc, def, null);
+            }
+            if (!string.IsNullOrEmpty(email) && HasAccountEmail(svc, dir, email))
+            {
+                duplicate = true;
+                try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch (Exception) { }
+                return true;
+            }
+            if (!IsBuiltinFolderSvc(svc))
+                lock (providerAccountEmails) providerAccountEmails[dir] = email ?? "";
+            return true;
+        }
+
+        static bool HasAccountEmail(string svc, string excludeDir, string email)
+        {
+            string main = MainEmail(svc);
+            if (!string.IsNullOrEmpty(main) && string.Equals(main, email, StringComparison.OrdinalIgnoreCase)) return true;
+            foreach (string sdir in ServiceAccountDirs(svc))
+            {
+                if (!Directory.Exists(sdir)) continue;
+                foreach (string d in Directory.GetDirectories(sdir))
+                {
+                    if (string.Equals(d, excludeDir, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (IsBuiltinFolderSvc(svc) && !System.IO.File.Exists(CredFile(svc, d))) continue;
+                    string e = AccountEmail(svc, d);
+                    if (!string.IsNullOrEmpty(e) && string.Equals(e, email, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+            }
+            return false;
+        }
+
+        static IEnumerable<string> ServiceAccountDirs(string svc)
+        {
+            yield return Path.Combine(AccountsDir, svc);
+            if (svc != null && svc.StartsWith("p-", StringComparison.Ordinal))
+                yield return Path.Combine(AccountsDir, svc.Substring(2));
+        }
+
+        public static bool RemoveAccount(string key)
+        {
+            string[] info;
+            lock (accounts) accounts.TryGetValue(key, out info);
+            if (info == null) return false;
+            try
+            {
+                if (info[0] == "agy") AgyAccounts.Remove(info[1]);
+                else if (Directory.Exists(info[1])) Directory.Delete(info[1], true);
+            }
+            catch (Exception) { return false; }
+            if (info[0] != "agy") lock (providerAccountEmails) providerAccountEmails.Remove(info[1]);
+            lock (accounts) accounts.Remove(key);
+            lock (defaultLabels) defaultLabels.Remove(key);
+            All.RemoveAll(x => x[0] == key);
+            return true;
+        }
+
+        // вызывается из окна (основной поток): возвращает только что найденные ИИ и дополнительные аккаунты
         public static List<string[]> ScanProviders()
         {
             var found = new List<string[]>();
             try
             {
                 if (!Directory.Exists(ProvidersDir)) Directory.CreateDirectory(ProvidersDir);
+                var seenProviders = new HashSet<string>(StringComparer.Ordinal);
                 foreach (string f in Directory.GetFiles(ProvidersDir, "*.json").OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
                 {
                     var d = File(f);
                     string name = Str(Get(d, "name"));
                     if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(Str(Get(d, "command")))) continue;
                     string key = "p-" + Path.GetFileNameWithoutExtension(f).ToLowerInvariant().Replace(",", "-").Replace(" ", "-");
+                    seenProviders.Add(key);
                     lock (providers) providers[key] = d;   // изменённый файл действует со следующего обновления
+                    var acc = Obj(d, "accounts");
+                    string accEnv = Str(Get(acc, "env")), accLogin = Str(Get(acc, "login"));
+                    lock (accountSpecs)
+                    {
+                        if (!string.IsNullOrEmpty(accEnv) || !string.IsNullOrEmpty(accLogin))
+                            accountSpecs[key] = new AccountSpec { Env = accEnv, Login = accLogin };
+                        else
+                            accountSpecs.Remove(key);
+                    }
                     if (All.Any(x => x[0] == key)) continue;
                     string color = Str(Get(d, "color"));
                     if (color == null || !System.Text.RegularExpressions.Regex.IsMatch(color, "^#[0-9A-Fa-f]{6}$"))
@@ -260,25 +576,182 @@ namespace AiLimitWidget
                     All.Add(entry);
                     found.Add(entry);
                 }
+                lock (accountSpecs)
+                    foreach (string k in accountSpecs.Keys.Where(k => k.StartsWith("p-", StringComparison.Ordinal) && !seenProviders.Contains(k)).ToList())
+                        accountSpecs.Remove(k);
             }
             catch (Exception) { }
+            ScanAccounts(found);
             return found;
         }
 
-        static ExtraResult Provider(string key, Dictionary<string, object> def)
+        static void ScanAccounts(List<string[]> found)
+        {
+            var active = new HashSet<string>(StringComparer.Ordinal);
+            List<string> svcs;
+            lock (accountSpecs) svcs = accountSpecs.Keys.ToList();
+            foreach (string svc in svcs)
+            {
+                try
+                {
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    string main = MainEmail(svc);
+                    if (!string.IsNullOrEmpty(main)) seen.Add(main);
+                    var dirs = new List<KeyValuePair<int, string>>();
+                    foreach (string sdir in ServiceAccountDirs(svc))
+                    {
+                        if (!Directory.Exists(sdir)) continue;
+                        foreach (string d in Directory.GetDirectories(sdir))
+                        {
+                            int n;
+                            if (int.TryParse(Path.GetFileName(d), NumberStyles.Integer, Inv, out n) && n > 0 && dirs.All(x => x.Key != n))
+                                dirs.Add(new KeyValuePair<int, string>(n, d));
+                        }
+                    }
+                    foreach (var pair in dirs.OrderBy(x => x.Key))
+                    {
+                        int n = pair.Key;
+                        string dir = pair.Value;
+                        if (!string.IsNullOrEmpty(WaitingDir) && string.Equals(dir, WaitingDir, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        string email;
+                        if (IsBuiltinFolderSvc(svc))
+                        {
+                            string cred = CredFile(svc, dir);
+                            if (!System.IO.File.Exists(cred))
+                            {
+                                // пустая папка без файла входа старше 30 минут — удаляем; с содержимым не трогаем
+                                if (Directory.GetCreationTime(dir) < DateTime.Now.AddMinutes(-30) && Directory.GetLastWriteTime(dir) < DateTime.Now.AddMinutes(-30)
+                                    && !Directory.EnumerateFileSystemEntries(dir).Any())
+                                    try { Directory.Delete(dir, true); } catch (Exception) { }
+                                continue;
+                            }
+                            email = AccountEmail(svc, dir);
+                            if (svc == "claude" && string.IsNullOrEmpty(email) && System.IO.File.GetLastWriteTime(cred) > DateTime.Now.AddSeconds(-4))
+                                continue;   // .claude.json дописывается следом за .credentials.json
+                        }
+                        else
+                        {
+                            bool confirmed;
+                            lock (providerAccountEmails) confirmed = providerAccountEmails.TryGetValue(dir, out email);
+                            if (!confirmed)
+                            {
+                                ProbeProviderAccount(svc, dir, n);
+                                continue;
+                            }
+                        }
+                        if (!string.IsNullOrEmpty(email) && !seen.Add(email))
+                        {
+                            // только что добавили тот же аккаунт — папку убираем; старую не трогаем (в ней могут быть
+                            // история и настройки, если ей пользуются из терминала) — просто не показываем
+                            if (Directory.GetCreationTime(dir) > DateTime.Now.AddHours(-1))
+                            {
+                                try { Directory.Delete(dir, true); } catch (Exception) { }
+                                lock (providerAccountEmails) providerAccountEmails.Remove(dir);
+                                LastDuplicateSvc = svc;
+                            }
+                            continue;
+                        }
+                        string key = "acc-" + svc + "-" + n.ToString(Inv);
+                        string label = !string.IsNullOrEmpty(email) ? email : "аккаунт " + n.ToString(Inv);
+                        RegisterAccount(key, label, Lighten(AiColor(svc)), new[] { svc, dir, n.ToString(Inv) }, active, found);
+                    }
+                }
+                catch (Exception) { }
+            }
+            try
+            {
+                string live = AgyAccounts.IsAdding ? MainAgyEmail : (AgyAccounts.LiveEmail() ?? MainAgyEmail);
+                var saved = AgyAccounts.Saved();
+                foreach (string email in saved)
+                {
+                    if (string.IsNullOrEmpty(email) || string.Equals(email, live, StringComparison.OrdinalIgnoreCase)) continue;
+                    string id = CleanId(email);
+                    string key = "acc-agy-" + id;
+                    RegisterAccount(key, email, Lighten(AiColor("agy")), new[] { "agy", email, id }, active, found);
+                }
+            }
+            catch (Exception) { }
+            lock (accounts)
+                foreach (string k in accounts.Keys.Where(k => !active.Contains(k)).ToList())
+                    accounts.Remove(k);
+            All.RemoveAll(x => x[0].StartsWith("acc-", StringComparison.Ordinal) && !active.Contains(x[0]));
+        }
+
+        static void ProbeProviderAccount(string svc, string dir, int n)
+        {
+            lock (probingDirs) { if (!probingDirs.Add(dir)) return; }
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    Dictionary<string, object> def;
+                    lock (providers) providers.TryGetValue(svc, out def);
+                    if (def == null) return;
+                    var r = Provider("acc-" + svc + "-" + n.ToString(Inv), def, dir);
+                    if (r.Confirmed)
+                        lock (providerAccountEmails) providerAccountEmails[dir] = r.Email ?? "";
+                    // команда не подтвердила вход (могла просто не ответить) — удаляем только пустую старую папку
+                    else if (Directory.Exists(dir) && Directory.GetCreationTime(dir) < DateTime.Now.AddMinutes(-30) && Directory.GetLastWriteTime(dir) < DateTime.Now.AddMinutes(-30)
+                             && !Directory.EnumerateFileSystemEntries(dir).Any())
+                        try { Directory.Delete(dir, true); } catch (Exception) { }
+                }
+                catch (Exception) { }
+                finally { lock (probingDirs) probingDirs.Remove(dir); }
+            });
+        }
+
+        static void RegisterAccount(string key, string defaultLabel, string color, string[] info, HashSet<string> active, List<string[]> found)
+        {
+            active.Add(key);
+            lock (accounts) accounts[key] = info;
+            string name = AccountTitle(key, defaultLabel);
+            var existing = All.FirstOrDefault(x => x[0] == key);
+            if (existing != null) { existing[1] = name; return; }
+            var entry = new[] { key, name, color };
+            All.Add(entry);
+            found.Add(entry);
+        }
+
+        static string ProviderArgs(object v)
+        {
+            string s = Str(v);
+            if (s != null) return s;
+            var a = v as System.Collections.IEnumerable;
+            if (a == null) return "";
+            return string.Join(" ", a.Cast<object>().Select(x => Str(x)).Where(x => !string.IsNullOrEmpty(x)));
+        }
+
+        static ExtraResult Provider(string key, Dictionary<string, object> def, string accountDir = null)
         {
             string name = Str(Get(def, "name")) ?? key;
+            string args = ProviderArgs(Get(def, "args")).Replace("{account}", string.IsNullOrEmpty(accountDir) ? "" : "\"" + accountDir + "\"").Trim();
+            Dictionary<string, string> env = null;
+            if (!string.IsNullOrEmpty(accountDir))
+            {
+                string envVar = Str(Get(Obj(def, "accounts"), "env"));
+                if (!string.IsNullOrEmpty(envVar)) env = new Dictionary<string, string> { { envVar, accountDir } };
+            }
             string text;
             try
             {
                 double timeout = Num(Get(def, "timeout")) ?? 30;
-                text = Background.Run(Str(Get(def, "command")), Str(Get(def, "args")) ?? "", Home, (int)(Math.Max(5, Math.Min(300, timeout)) * 1000));
+                text = Background.Run(Str(Get(def, "command")), args, Home, (int)(Math.Max(5, Math.Min(300, timeout)) * 1000), env);
             }
-            catch (Exception) { return new ExtraResult { Problem = name + ": команда не запускается — проверьте command в " + key.Substring(2) + ".json" }; }
+            catch (Exception)
+            {
+                string pKey = key.StartsWith("p-", StringComparison.Ordinal) ? key.Substring(2) : key;
+                return new ExtraResult { Problem = name + ": команда не запускается — проверьте command в " + pKey + ".json" };
+            }
             var d = Parse(text == null ? null : text.Trim());
             if (d == null) return new ExtraResult { Problem = name + " не ответил или ответ не JSON" };
-            if (Bool(Get(d, "signed_in")) == false) return new ExtraResult { SignedIn = false };
-            var r = new ExtraResult { Plan = Str(Get(d, "plan")) ?? "", Email = Str(Get(d, "email")), Problem = Str(Get(d, "problem")) };
+            bool? signedIn = Bool(Get(d, "signed_in"));
+            if (signedIn == false || (accountDir != null && signedIn != true)) return new ExtraResult { SignedIn = false };
+            var r = new ExtraResult { Confirmed = signedIn == true, Plan = Str(Get(d, "plan")) ?? "", Email = Str(Get(d, "email")), Problem = Str(Get(d, "problem")) };
+            if (accountDir == null && !string.IsNullOrEmpty(r.Email))
+                lock (mainProviderEmails) mainProviderEmails[key] = r.Email;
+            else if (accountDir != null && !string.IsNullOrEmpty(r.Email))
+                lock (providerAccountEmails) providerAccountEmails[accountDir] = r.Email;
             var limits = Get(d, "limits") as System.Collections.IEnumerable;
             var list = new List<Limit>();
             if (limits != null)
@@ -300,6 +773,7 @@ namespace AiLimitWidget
 
         public static ExtraResult Fetch(string key)
         {
+            if (key != null && key.StartsWith("acc-", StringComparison.Ordinal)) return Account(key);
             switch (key)
             {
                 case "geminicli": return Gemini();
@@ -310,6 +784,200 @@ namespace AiLimitWidget
                     lock (providers) providers.TryGetValue(key, out def);
                     return def != null ? Provider(key, def) : new ExtraResult { SignedIn = false };
             }
+        }
+
+        // ---------- дополнительные аккаунты (Claude Code, Codex, Gemini CLI, Antigravity, провайдеры) ----------
+        static ExtraResult Account(string key)
+        {
+            string[] info;
+            lock (accounts) accounts.TryGetValue(key, out info);
+            if (info == null) return new ExtraResult { SignedIn = false };
+            string svc = info[0], target = info[1];
+            if (svc == "claude") return ClaudeExtra(key, target);
+            if (svc == "codex") return CodexExtra(key, target, false);
+            if (svc == "geminicli") return Gemini(target, key);
+            if (svc == "agy") return AgyExtra(key, target);
+            Dictionary<string, object> def;
+            lock (providers) providers.TryGetValue(svc, out def);
+            return def != null ? Provider(key, def, target) : new ExtraResult { SignedIn = false };
+        }
+
+        static ExtraResult ClaudeExtra(string key, string dir)
+        {
+            string credPath = Path.Combine(dir, ".credentials.json");
+            var d = File(credPath);
+            var oauth = Obj(d, "claudeAiOauth");
+            if (oauth == null) return new ExtraResult { SignedIn = false };
+            string email = AccountEmail("claude", dir);
+            string plan = Widget.PlanName(Str(Get(oauth, "subscriptionType")) ?? "", Str(Get(oauth, "rateLimitTier")) ?? "");
+            string token = Str(Get(oauth, "accessToken"));
+            double? expMs = Num(Get(oauth, "expiresAt"));
+            DateTime exp = expMs.HasValue ? DateTimeOffset.FromUnixTimeMilliseconds((long)expMs.Value).LocalDateTime : DateTime.MinValue;
+            if (string.IsNullOrEmpty(token) || exp < DateTime.Now.AddSeconds(60))
+            {
+                string refresh = Str(Get(oauth, "refreshToken"));
+                if (string.IsNullOrEmpty(refresh)) return new ExtraResult { Plan = plan, Email = email, Problem = ExpiredAccountText };
+                var scopesObj = Get(oauth, "scopes") as System.Collections.IEnumerable;
+                string scope = scopesObj == null ? "" : string.Join(" ", scopesObj.Cast<object>().Select(x => Str(x)).Where(x => !string.IsNullOrEmpty(x)));
+                string body = new JavaScriptSerializer().Serialize(new Dictionary<string, object> {
+                    { "grant_type", "refresh_token" }, { "refresh_token", refresh },
+                    { "client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e" }, { "scope", scope } });
+                string rt;
+                int rc = Http("https://platform.claude.com/v1/oauth/token", "POST", new Dictionary<string, string> {
+                    { "Content-Type", "application/json" }, { "Accept", "application/json" }, { "User-Agent", "claude-code/2.0 AiLimitWidget/1.0" } }, body, out rt);
+                var rd = Ok(rc) ? Parse(rt) : null;
+                token = Str(Get(rd, "access_token"));
+                if (string.IsNullOrEmpty(token))
+                    return new ExtraResult { Plan = plan, Email = email, Problem = rc == 0 ? "Нет соединения — повторю позже" : ExpiredAccountText };
+                oauth["accessToken"] = token;
+                string nr = Str(Get(rd, "refresh_token"));
+                if (!string.IsNullOrEmpty(nr)) oauth["refreshToken"] = nr;
+                double? expIn = Num(Get(rd, "expires_in"));
+                if (expIn.HasValue) oauth["expiresAt"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + (long)(expIn.Value * 1000);
+                try { System.IO.File.WriteAllText(credPath, new JavaScriptSerializer().Serialize(d), new UTF8Encoding(false)); } catch (Exception) { }
+            }
+            string text;
+            int code = Http(Widget.UsageUrl, "GET", new Dictionary<string, string> {
+                { "Authorization", "Bearer " + token }, { "anthropic-beta", "oauth-2025-04-20" }, { "User-Agent", "claude-code/2.0 AiLimitWidget/1.0" } }, null, out text);
+            var u = Ok(code) ? Parse(text) : null;
+            if (u == null)
+            {
+                if (code == 401 || code == 403) return new ExtraResult { Plan = plan, Email = email, Problem = ExpiredAccountText };
+                return Problem("Claude Code", code);
+            }
+            var r = new ExtraResult { Plan = plan, Email = email };
+            var s = Widget.ReadLimit(u, "five_hour", "Сессия (5 ч)") ?? new Limit { Key = "five_hour", Title = "Сессия (5 ч)" };
+            s.Key = key + "-" + s.Key;
+            s.WindowSeconds = 18000;
+            r.Limits.Add(s);
+            var keys = Widget.WeeklyKeys.Select(w => w[0]).Concat(u.Keys.Where(k => k != "five_hour" && k != "extra_usage" && Widget.WeeklyKeys.All(w => w[0] != k)));
+            foreach (var k in keys)
+            {
+                var o = Obj(u, k);
+                if (o == null || Get(o, "utilization") == null) continue;
+                var l = Widget.ReadLimit(u, k, Widget.LimitTitle(k, o));
+                if (l != null)
+                {
+                    l.Key = key + "-" + k;
+                    l.WindowSeconds = 604800;
+                    if (r.LongKey == null) r.LongKey = l.Key;
+                    r.Limits.Add(l);
+                }
+            }
+            var extra = Obj(u, "extra_usage");
+            if (extra != null && Bool(Get(extra, "is_enabled")) == true && Get(extra, "utilization") != null)
+                r.Limits.Add(new Limit { Key = key + "-extra", Title = "Доп. кредиты (месяц)", Percent = Convert.ToDouble(Get(extra, "utilization"), Inv), WindowSeconds = 30 * 86400 });
+            return r;
+        }
+
+        static ExtraResult CodexExtra(string key, string dir, bool retried)
+        {
+            string authPath = Path.Combine(dir, "auth.json");
+            var d = File(authPath);
+            var tokens = Obj(d, "tokens");
+            string token = Str(Get(tokens, "access_token"));
+            if (string.IsNullOrEmpty(token)) return new ExtraResult { SignedIn = false };
+            string accountId = Str(Get(tokens, "account_id"));
+            string email = Str(Get(Claims(Str(Get(tokens, "id_token"))), "email"));
+            var headers = new Dictionary<string, string> {
+                { "Authorization", "Bearer " + token }, { "User-Agent", "codex_cli_rs AiLimitWidget/1.0" },
+                { "originator", "codex_cli_rs" }, { "Accept", "application/json" } };
+            if (!string.IsNullOrEmpty(accountId)) headers["ChatGPT-Account-Id"] = accountId;
+            string text;
+            int code = Http(Widget.CodexUsageUrl, "GET", headers, null, out text);
+            if (code == 401 && !retried)
+            {
+                string refresh = Str(Get(tokens, "refresh_token"));
+                if (string.IsNullOrEmpty(refresh)) return new ExtraResult { Email = email, Problem = ExpiredAccountText };
+                string body = new JavaScriptSerializer().Serialize(new Dictionary<string, object> {
+                    { "client_id", "app_EMoamEEZ73f0CkXaXp7hrann" }, { "grant_type", "refresh_token" },
+                    { "refresh_token", refresh }, { "scope", "openid profile email" } });
+                string rt;
+                int rc = Http("https://auth.openai.com/oauth/token", "POST", new Dictionary<string, string> {
+                    { "Content-Type", "application/json" }, { "Accept", "application/json" }, { "User-Agent", "codex_cli_rs AiLimitWidget/1.0" } }, body, out rt);
+                var rd = Ok(rc) ? Parse(rt) : null;
+                string na = Str(Get(rd, "access_token"));
+                if (string.IsNullOrEmpty(na))
+                    return new ExtraResult { Email = email, Problem = rc == 0 ? "Нет соединения — повторю позже" : ExpiredAccountText };
+                tokens["access_token"] = na;
+                string ni = Str(Get(rd, "id_token"));
+                if (!string.IsNullOrEmpty(ni)) tokens["id_token"] = ni;
+                string nr = Str(Get(rd, "refresh_token"));
+                if (!string.IsNullOrEmpty(nr)) tokens["refresh_token"] = nr;
+                d["last_refresh"] = DateTime.UtcNow.ToString("o", Inv);
+                try { System.IO.File.WriteAllText(authPath, new JavaScriptSerializer().Serialize(d), new UTF8Encoding(false)); } catch (Exception) { }
+                return CodexExtra(key, dir, true);
+            }
+            var u = Ok(code) ? Parse(text) : null;
+            if (u == null)
+            {
+                if (code == 401 || code == 403) return new ExtraResult { Email = email, Problem = ExpiredAccountText };
+                return Problem("Codex", code);
+            }
+            var r = new ExtraResult { Email = email, Plan = Capital(Str(Get(u, "plan_type")) ?? "") };
+            var rl = Obj(u, "rate_limit");
+            var list = new List<Limit>();
+            var windows = new[] { "primary_window", "secondary_window" };
+            foreach (string w in rl == null ? windows : windows.Concat(rl.Keys.Where(k => !windows.Contains(k))))
+            {
+                var o = Obj(rl, w);
+                double? used = Num(Get(o, "used_percent"));
+                if (o == null || !used.HasValue) continue;
+                long secs = (long)(Num(Get(o, "limit_window_seconds")) ?? 0);
+                double? at = Num(Get(o, "reset_at"));
+                list.Add(new Limit { Key = key + "-" + w, Title = Widget.WindowTitle(secs), WindowSeconds = secs,
+                                     Percent = Clamp(used.Value),
+                                     ResetsAt = at.HasValue ? (DateTime?)DateTimeOffset.FromUnixTimeSeconds((long)at.Value).LocalDateTime : null });
+            }
+            r.Limits.AddRange(list.OrderBy(l => l.WindowSeconds));
+            if (r.Limits.Count == 0) r.Problem = "Сервер не сообщил лимиты";
+            return r;
+        }
+
+        static ExtraResult AgyExtra(string key, string email)
+        {
+            if (AgyAccounts.IsAdding) return new ExtraResult { Busy = true };
+            string[] pair = null;
+            try
+            {
+                pair = AgyAccounts.Use(email, () =>
+                {
+                    bool m, ignored;
+                    string q = Widget.RunAgy("/quota", out m);
+                    return new[] { q, q == null ? null : Widget.RunAgy("/credits", out ignored) };
+                });
+            }
+            catch (Exception) { }
+            if (pair == null) return new ExtraResult { Busy = true };
+            string quota = pair[0], credits = pair[1];
+            if (string.IsNullOrEmpty(quota)) return new ExtraResult { Email = email, Problem = "Antigravity не ответил — повторю позже" };
+            string problem;
+            var groups = Widget.AgyGroupsOf(quota, out problem);
+            if (groups == null)
+                return new ExtraResult { Email = email, Problem = problem == Widget.AgyNoAuthText ? ExpiredAccountText : (problem ?? "Antigravity вернул ошибку") };
+            double? cr = Widget.CreditsOf(credits);
+            var r = new ExtraResult { Email = email, Plan = cr.HasValue && cr.Value > 0 ? "кредиты: " + Math.Round(cr.Value) : "" };
+            foreach (var g in groups)
+            {
+                if (g.Session != null)
+                {
+                    g.Session.Key = key + "-" + g.Session.Key;
+                    g.Session.Title = g.Title + " · 5 ч";
+                    g.Session.WindowSeconds = 18000;
+                    r.Limits.Add(g.Session);
+                }
+                if (g.Week != null)
+                {
+                    g.Week.Key = key + "-" + g.Week.Key;
+                    g.Week.Title = g.Title + " · неделя";
+                    g.Week.WindowSeconds = 604800;
+                    if (r.LongKey == null) r.LongKey = g.Week.Key;
+                    r.Limits.Add(g.Week);
+                }
+            }
+            r.Groups = groups;
+            if (r.Limits.Count == 0) r.Problem = "Antigravity не сообщил лимиты";
+            return r;
         }
 
         // ---------- JSON ----------
@@ -468,23 +1136,26 @@ namespace AiLimitWidget
             }
         }
 
-        static ExtraResult Gemini()
+        static ExtraResult Gemini(string homeDir = null, string keyPrefix = "geminicli")
         {
-            var creds = File(Path.Combine(GeminiDir, "oauth_creds.json"));
+            bool extra = homeDir != null;
+            string dir = extra ? Path.Combine(homeDir, ".gemini") : GeminiDir;
+            string credPath = Path.Combine(dir, "oauth_creds.json");
+            var creds = File(credPath);
             if (creds == null) return new ExtraResult { SignedIn = false };
             // вошли по API-ключу или через Vertex — лимитов подписки нет
-            string type = Str(Get(Obj(Obj(File(Path.Combine(GeminiDir, "settings.json")), "security"), "auth"), "selectedType"));
+            string type = Str(Get(Obj(Obj(File(Path.Combine(dir, "settings.json")), "security"), "auth"), "selectedType"));
             if (!string.IsNullOrEmpty(type) && type != "oauth-personal") return new ExtraResult { SignedIn = false };
             string token = Str(Get(creds, "access_token")) ?? "";
             double? expiryMs = Num(Get(creds, "expiry_date"));
             DateTime expiry = expiryMs.HasValue ? DateTimeOffset.FromUnixTimeMilliseconds((long)expiryMs.Value).LocalDateTime : DateTime.MinValue;
             if (expiry < DateTime.Now.AddSeconds(60))
             {
-                if (geminiToken != null && geminiTokenUntil > DateTime.Now.AddSeconds(60)) token = geminiToken;
+                if (!extra && geminiToken != null && geminiTokenUntil > DateTime.Now.AddSeconds(60)) token = geminiToken;
                 else
                 {
                     string refresh = Str(Get(creds, "refresh_token"));
-                    if (string.IsNullOrEmpty(refresh)) return new ExtraResult { SignedIn = false };
+                    if (string.IsNullOrEmpty(refresh)) return extra ? new ExtraResult { Problem = ExpiredAccountText } : new ExtraResult { SignedIn = false };
                     string form = "client_id=" + Uri.EscapeDataString(GeminiClientId) + "&client_secret=" + Uri.EscapeDataString(GeminiClientSecret)
                                 + "&refresh_token=" + Uri.EscapeDataString(refresh) + "&grant_type=refresh_token";
                     string text;
@@ -494,12 +1165,27 @@ namespace AiLimitWidget
                     string t = Str(Get(d, "access_token"));
                     if (string.IsNullOrEmpty(t))
                     {
+                        if (extra) return new ExtraResult { Problem = code == 0 ? "Нет соединения — повторю позже" : ExpiredAccountText };
                         if (code == 400 || code == 401) return new ExtraResult { Problem = "Вход Gemini CLI устарел — запустите gemini и войдите снова" };
                         return Problem("Gemini CLI", code);
                     }
                     token = t;
-                    geminiToken = t;
-                    geminiTokenUntil = DateTime.Now.AddSeconds(Num(Get(d, "expires_in")) ?? 3000);
+                    if (extra)
+                    {
+                        creds["access_token"] = t;
+                        string nr = Str(Get(d, "refresh_token"));
+                        if (!string.IsNullOrEmpty(nr)) creds["refresh_token"] = nr;
+                        string ni = Str(Get(d, "id_token"));
+                        if (!string.IsNullOrEmpty(ni)) creds["id_token"] = ni;
+                        double? expIn = Num(Get(d, "expires_in"));
+                        creds["expiry_date"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + (long)((expIn ?? 3600) * 1000);
+                        try { System.IO.File.WriteAllText(credPath, new JavaScriptSerializer().Serialize(creds), new UTF8Encoding(false)); } catch (Exception) { }
+                    }
+                    else
+                    {
+                        geminiToken = t;
+                        geminiTokenUntil = DateTime.Now.AddSeconds(Num(Get(d, "expires_in")) ?? 3000);
+                    }
                 }
             }
             var headers = new Dictionary<string, string> {
@@ -511,17 +1197,17 @@ namespace AiLimitWidget
             int lc = Http(CodeAssist + "loadCodeAssist", "POST", headers,
                           "{\"metadata\":{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}}", out lt);
             var load = Ok(lc) ? Parse(lt) : null;
-            if (load == null) return Problem("Gemini CLI", lc);
+            if (load == null) return extra && (lc == 401 || lc == 403) ? new ExtraResult { Email = r.Email, Problem = ExpiredAccountText } : Problem("Gemini CLI", lc);
             var tier = Obj(load, "paidTier") ?? Obj(load, "currentTier");
             r.Plan = (Str(Get(tier, "name")) ?? Str(Get(tier, "id")) ?? "").Replace("Gemini Code Assist ", "");
-            string project = Str(Get(load, "cloudaicompanionProject")) ?? Str(Get(Obj(load, "cloudaicompanionProject"), "id")) ?? geminiProject;
-            geminiProject = project;
+            string project = Str(Get(load, "cloudaicompanionProject")) ?? Str(Get(Obj(load, "cloudaicompanionProject"), "id")) ?? (extra ? null : geminiProject);
+            if (!extra) geminiProject = project;
             var q = new Dictionary<string, object>();
             if (project != null) q["project"] = project;
             string qt;
             int qc = Http(CodeAssist + "retrieveUserQuota", "POST", headers, new JavaScriptSerializer().Serialize(q), out qt);
             var quota = Ok(qc) ? Parse(qt) : null;
-            if (quota == null) return Problem("Gemini CLI", qc);
+            if (quota == null) return extra && (qc == 401 || qc == 403) ? new ExtraResult { Email = r.Email, Problem = ExpiredAccountText } : Problem("Gemini CLI", qc);
             // по модели — остаток запросов на сутки; показываем Pro и Flash, остальные модели делят те же лимиты
             var byModel = new Dictionary<string, Limit>();
             var buckets = Get(quota, "buckets") as System.Collections.IEnumerable;
@@ -535,7 +1221,7 @@ namespace AiLimitWidget
                     string title = model.Contains("pro") ? "Сутки · Pro" : model.Contains("flash") ? "Сутки · Flash" : "Сутки · " + model;
                     Limit old;
                     if (byModel.TryGetValue(title, out old) && old.Percent >= used) continue;
-                    byModel[title] = new Limit { Key = "geminicli-" + title, Title = title, Percent = used, ResetsAt = Time(Get(b, "resetTime")), WindowSeconds = 86400 };
+                    byModel[title] = new Limit { Key = keyPrefix + "-" + title, Title = title, Percent = used, ResetsAt = Time(Get(b, "resetTime")), WindowSeconds = 86400 };
                 }
             r.Limits.AddRange(byModel.Values.OrderByDescending(l => l.Percent));
             if (r.Limits.Count == 0) r.Problem = "Сервер не сообщил лимиты";
@@ -869,11 +1555,231 @@ namespace AiLimitWidget
         }
     }
 
+    // Несколько аккаунтов Antigravity на одном пользователе Windows. agy хранит вход в диспетчере учётных данных —
+    // запись «gemini:antigravity», одна на пользователя. Сохранённые входы — «agy-account:<почта>»; так же их хранит
+    // и скилл ace, поэтому аккаунт, добавленный здесь, видит ace, и наоборот. Общие правила:
+    //   - если сохранён хоть один аккаунт, текущий вход тоже сохраняется;
+    //   - аккаунт, в который сейчас вошёл agy, — первый, остальные — по почте;
+    //   - запрос под другим аккаунтом: блокировка account.lock (байт 0), подставили его вход, запрос, сохранили
+    //     обновлённый токен, вернули прежний вход. Пока прежний вход снят, его почта лежит в account.restore —
+    //     если процесс убили, следующий запрос сам вернёт вход.
+    static class AgyAccounts
+    {
+        const string Live = "gemini:antigravity", Prefix = "agy-account:";
+        public const int WaitMs = 20000;   // ace может держать аккаунт, пока выполняет задачу: дольше не ждём
+
+        static string Dir { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".gemini", "antigravity-accounts"); } }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct Cred
+        {
+            public int Flags, Type;
+            public string TargetName, Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public int CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public int Persist, AttributeCount;
+            public IntPtr Attributes;
+            public string TargetAlias, UserName;
+        }
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CredReadW(string target, int type, int flags, out IntPtr cred);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CredWriteW(ref Cred cred, int flags);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CredEnumerateW(string filter, int flags, out int count, out IntPtr list);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CredDeleteW(string target, int type, int flags);
+        [DllImport("advapi32.dll")] static extern void CredFree(IntPtr buffer);
+
+        static byte[] Read(string target)
+        {
+            IntPtr p;
+            if (!CredReadW(target, 1, 0, out p)) return null;
+            try
+            {
+                var c = (Cred)Marshal.PtrToStructure(p, typeof(Cred));
+                var bytes = new byte[c.CredentialBlobSize];
+                if (bytes.Length > 0) Marshal.Copy(c.CredentialBlob, bytes, 0, bytes.Length);
+                return bytes;
+            }
+            finally { CredFree(p); }
+        }
+
+        static void Write(string target, byte[] blob, string user)
+        {
+            IntPtr buf = Marshal.AllocHGlobal(blob.Length);
+            try
+            {
+                Marshal.Copy(blob, 0, buf, blob.Length);
+                var c = new Cred { Type = 1, TargetName = target, UserName = user, Persist = 2, CredentialBlobSize = blob.Length, CredentialBlob = buf };
+                if (!CredWriteW(ref c, 0)) throw new IOException("CredWrite " + target + ": " + Marshal.GetLastWin32Error());
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
+        public static string Email(byte[] blob)
+        {
+            try
+            {
+                var d = new JavaScriptSerializer().DeserializeObject(Encoding.UTF8.GetString(blob ?? new byte[0])) as Dictionary<string, object>;
+                object e;
+                return d != null && d.TryGetValue("id_token_email", out e) ? Convert.ToString(e, CultureInfo.InvariantCulture) : null;
+            }
+            catch (Exception) { return null; }
+        }
+
+        static string Put(byte[] blob)
+        {
+            string e = Email(blob);
+            if (!string.IsNullOrEmpty(e)) Write(Prefix + e, blob, e);
+            return e;
+        }
+
+        public static List<string> Saved()
+        {
+            var names = new List<string>();
+            IntPtr list;
+            int count;
+            if (!CredEnumerateW(Prefix + "*", 0, out count, out list)) return names;
+            try
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    var c = (Cred)Marshal.PtrToStructure(Marshal.ReadIntPtr(list, i * IntPtr.Size), typeof(Cred));
+                    if (c.TargetName != null && c.TargetName.StartsWith(Prefix)) names.Add(c.TargetName.Substring(Prefix.Length));
+                }
+            }
+            finally { CredFree(list); }
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            return names;
+        }
+
+        public static string LiveEmail() { return Email(Read(Live)); }
+
+        public static void Remove(string email) { CredDeleteW(Prefix + email, 1, 0); }
+
+        // блокировка, общая с ace; null — аккаунт занят дольше waitMs
+        static FileStream Lock(int waitMs)
+        {
+            Directory.CreateDirectory(Dir);
+            var fs = new FileStream(Path.Combine(Dir, "account.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+            DateTime until = DateTime.Now.AddMilliseconds(waitMs);
+            while (true)
+            {
+                try { fs.Lock(0, 1); return fs; }
+                catch (IOException) { }
+                if (DateTime.Now > until) { fs.Dispose(); return null; }
+                Thread.Sleep(200);
+            }
+        }
+
+        static string Mark { get { return Path.Combine(Dir, "account.restore"); } }
+        static string Adding { get { return Path.Combine(Dir, "adding"); } }
+
+        // прошлый запрос не вернул вход (процесс убили) — возвращаем
+        static void RestoreAfterCrash()
+        {
+            if (!File.Exists(Mark)) return;
+            byte[] orig = Read(Prefix + File.ReadAllText(Mark).Trim()), live = Read(Live);
+            if (orig != null && (live == null || Email(live) != Email(orig)))
+            {
+                if (live != null && Saved().Contains(Email(live))) Put(live);
+                Write(Live, orig, Email(orig));
+            }
+            File.Delete(Mark);
+        }
+
+        // Добавление аккаунта: текущий вход сохраняем и запоминаем, затем пользователь входит в agy другим аккаунтом.
+        // Как только в agy новый вход — сохраняем его и возвращаем прежний (FinishAdding).
+        public static bool StartAdding()
+        {
+            using (var l = Lock(WaitMs))
+            {
+                if (l == null) return false;
+                RestoreAfterCrash();
+                string e = Put(Read(Live) ?? new byte[0]);
+                if (string.IsNullOrEmpty(e)) return false;
+                // первая строка — к какому входу вернуться, дальше — уже сохранённые: новый вход — тот, которого среди них нет
+                File.WriteAllLines(Adding, new[] { e }.Concat(Saved()));
+                return true;
+            }
+        }
+
+        public static bool IsAdding
+        {
+            get
+            {
+                try { return File.Exists(Adding) && File.GetLastWriteTime(Adding) > DateTime.Now.AddMinutes(-30); }
+                catch (Exception) { return false; }
+            }
+        }
+
+        static void FinishAdding()
+        {
+            if (!File.Exists(Adding)) return;
+            var known = File.ReadAllLines(Adding).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+            if (!IsAdding || known.Count == 0) { File.Delete(Adding); return; }   // за полчаса так и не вошли — забываем
+            string orig = known[0];
+            byte[] live = Read(Live), back = Read(Prefix + orig);
+            // ещё не вошли (или ace на время подставил один из уже сохранённых входов)
+            if (live == null || back == null || known.Contains(Email(live) ?? "")) return;
+            Put(live);
+            Write(Live, back, orig);
+            File.Delete(Adding);
+        }
+
+        // почты аккаунтов, первый — тот, в который вошёл agy; null — аккаунт занят запуском ace.
+        // Один аккаунт (или ни одного сохранённого) — пустой список: всё как без аккаунтов.
+        public static List<string> Prepare()
+        {
+            using (var l = Lock(WaitMs))
+            {
+                if (l == null) return null;
+                RestoreAfterCrash();
+                FinishAdding();
+                var names = Saved();
+                byte[] live = Read(Live);
+                string le = Email(live);
+                if (names.Count > 0 && !string.IsNullOrEmpty(le) && !names.Contains(le)) { Put(live); names = Saved(); }
+                var ordered = names.Contains(le ?? "") ? new[] { le }.Concat(names.Where(n => n != le)).ToList() : names;
+                return ordered.Count > 1 ? ordered : new List<string>();
+            }
+        }
+
+        // выполнить body под входом аккаунта email; null — аккаунт занят или вход не сохранён
+        public static T Use<T>(string email, Func<T> body) where T : class
+        {
+            using (var l = Lock(WaitMs))
+            {
+                if (l == null) return null;
+                RestoreAfterCrash();
+                byte[] want = Read(Prefix + email);
+                if (want == null) return null;
+                byte[] before = Read(Live);
+                bool swap = before == null || Email(before) != email;
+                if (swap)
+                {
+                    if (before != null && Saved().Contains(Email(before)))
+                    {
+                        Put(before);
+                        File.WriteAllText(Mark, Email(before));
+                    }
+                    Write(Live, want, email);
+                }
+                try { return body(); }
+                finally
+                {
+                    byte[] now = Read(Live);
+                    if (now != null && Email(now) == email) Put(now);   // agy мог обновить токен
+                    if (swap && before != null) Write(Live, before, Email(before));
+                    if (File.Exists(Mark)) File.Delete(Mark);
+                }
+            }
+        }
+    }
+
     sealed class Widget
     {
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
         static readonly CultureInfo Ru = CultureInfo.GetCultureInfo("ru-RU");
-        const string UsageUrl = "https://api.anthropic.com/api/oauth/usage";
+        internal const string UsageUrl = "https://api.anthropic.com/api/oauth/usage";
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RunName = "AiLimitWidget";
         const double DockMargin = 12;
@@ -883,7 +1789,7 @@ namespace AiLimitWidget
 
         // известные лимиты Claude — с понятными названиями и в этом порядке; остальные лимиты из ответа
         // (новые, которых тут нет) показываются после них сами — с названием из ключа или суммой в долларах
-        static readonly string[][] WeeklyKeys = {
+        internal static readonly string[][] WeeklyKeys = {
             new[] { "seven_day", "Неделя · все модели" },
             new[] { "seven_day_opus", "Неделя · Opus" },
             new[] { "seven_day_sonnet", "Неделя · Sonnet" },
@@ -891,7 +1797,7 @@ namespace AiLimitWidget
             new[] { "seven_day_oauth_apps", "Неделя · приложения" }
         };
 
-        static string LimitTitle(string key, Dictionary<string, object> o)
+        internal static string LimitTitle(string key, Dictionary<string, object> o)
         {
             var known = WeeklyKeys.FirstOrDefault(w => w[0] == key);
             if (known != null) return known[1];
@@ -910,13 +1816,6 @@ namespace AiLimitWidget
 
         static Color GroupColor(string key)
         {
-            // группы второго и следующих аккаунтов Antigravity — тот же цвет, только светлее
-            int at = (key ?? "").IndexOf('@');
-            if (at > 0)
-            {
-                Color c = GroupColor(key.Substring(0, at));
-                return Color.FromRgb((byte)(c.R + (255 - c.R) * 0.45), (byte)(c.G + (255 - c.G) * 0.45), (byte)(c.B + (255 - c.B) * 0.45));
-            }
             switch (key)
             {
                 case "claude": return Accent;
@@ -973,6 +1872,11 @@ namespace AiLimitWidget
         bool ClockShows(string key) { return settings.ClockItems.Split(',').Contains(key); }
 
         static Color C(string hex) { return (Color)ColorConverter.ConvertFromString(hex); }
+
+        static Color Lighter(Color c)
+        {
+            return Color.FromRgb((byte)(c.R + (255 - c.R) * 0.45), (byte)(c.G + (255 - c.G) * 0.45), (byte)(c.B + (255 - c.B) * 0.45));
+        }
         static SolidColorBrush B(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
         static SolidColorBrush B(string hex) { return B(C(hex)); }
 
@@ -988,8 +1892,6 @@ namespace AiLimitWidget
         bool agyNoAuth;   // agy есть, но входа в нём нет — раздел прячем
         bool agyChecked;  // agy уже хоть раз ответил (или не нашёлся)
         double? agyCredits;
-        // второй и следующие аккаунты Antigravity (входы, сохранённые в ace): { название, почта, ответ /quota, ответ /credits }
-        readonly List<string[]> agyExtra = new List<string[]>();
         DateTime? agyUpdatedAt;
         DateTime agyNextFetch = DateTime.MinValue;
         readonly Settings settings = new Settings();
@@ -1319,12 +2221,23 @@ namespace AiLimitWidget
                     EmbedInTaskbar(hwnd, bar);
                     var source = PresentationSource.FromVisual(clock);
                     double scale = source != null && source.CompositionTarget != null ? source.CompositionTarget.TransformToDevice.M11 : 1;
-                    int labelWidthPx = (int)(clock.ActualWidth * scale);
-                    int labelHeightPx = (int)(clock.ActualHeight * scale);
+                    // окно внутри панели задач само не растёт, когда добавляются столбцы (например, второй аккаунт), —
+                    // меряем надпись и задаём размер сами, иначе правые столбцы обрезаются
+                    clockBox.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                    Size want = clockBox.DesiredSize;
+                    double w = Math.Max(want.Width, clock.MinWidth), h = Math.Max(want.Height, clock.MinHeight);
+                    if (Math.Abs(clock.ActualWidth - w) > 0.5 || Math.Abs(clock.ActualHeight - h) > 0.5)
+                    {
+                        clock.SizeToContent = SizeToContent.Manual;
+                        clock.Width = w;
+                        clock.Height = h;
+                    }
+                    int labelWidthPx = (int)Math.Ceiling(w * scale);
+                    int labelHeightPx = (int)Math.Ceiling(h * scale);
                     int x = (int)(nr.Left - labelWidthPx + ChevronOverlap * scale);
                     int y = (tb.Top + tb.Bottom) / 2 - labelHeightPx / 2;
                     // координаты дочернего окна — от левого верхнего угла панели задач
-                    SetWindowPos(hwnd, HWND_TOP, x - tb.Left, y - tb.Top, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER);
+                    SetWindowPos(hwnd, HWND_TOP, x - tb.Left, y - tb.Top, labelWidthPx, labelHeightPx, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER);
                     if (!clock.IsVisible) clock.Show();
                     return;
                 }
@@ -1377,7 +2290,22 @@ namespace AiLimitWidget
                 if ((v = Get(d, "ClockItems")) != null) settings.ClockItems = Convert.ToString(v, Inv);
                 if ((v = Get(d, "HiddenExtras")) != null) settings.HiddenExtras = Convert.ToString(v, Inv);
                 if ((v = Get(d, "AgyKeys")) != null) settings.AgyKeys = Convert.ToString(v, Inv);
+                // столбцы «gemini@2» от прошлой версии (второй аккаунт внутри раздела Antigravity) — больше не существуют
+                settings.ClockItems = string.Join(",", settings.ClockItems.Split(',').Where(k => k.Length > 0 && !k.Contains("@")));
+                settings.AgyKeys = string.Join(",", settings.AgyKeys.Split(',').Where(k => k.Length > 0 && !k.Contains("@")));
                 if ((v = Get(d, "SeenExtras")) != null) settings.SeenExtras = Convert.ToString(v, Inv);
+                var accNames = Get(d, "AccountNames") as Dictionary<string, object>;
+                if (accNames != null)
+                {
+                    settings.AccountNames.Clear();
+                    foreach (var kv in accNames)
+                    {
+                        string val = Convert.ToString(kv.Value, Inv);
+                        if (!string.IsNullOrEmpty(kv.Key) && !string.IsNullOrEmpty(val))
+                            settings.AccountNames[kv.Key] = val;
+                    }
+                }
+                Extra.SetCustomNames(settings.AccountNames);
             }
             catch (Exception) { }
             if (!Positions.Contains(settings.Position)) settings.Position = "TR";
@@ -1407,7 +2335,8 @@ namespace AiLimitWidget
                     { "Left", settings.Left }, { "Top", settings.Top }, { "KeepOpen", settings.KeepOpen }, { "Notify", settings.Notify }, { "ClockLabel", settings.ClockLabel },
                     { "ShowClaude", settings.ShowClaude }, { "ShowAgy", settings.ShowAgy }, { "ShowCodex", settings.ShowCodex },
                     { "ClockItems", settings.ClockItems }, { "ClockVersion", settings.ClockVersion }, { "LoggedOut", settings.LoggedOut }, { "ShowDetails", settings.ShowDetails },
-                    { "HiddenExtras", settings.HiddenExtras }, { "AgyKeys", settings.AgyKeys }, { "SeenExtras", settings.SeenExtras } };
+                    { "HiddenExtras", settings.HiddenExtras }, { "AgyKeys", settings.AgyKeys }, { "SeenExtras", settings.SeenExtras },
+                    { "AccountNames", settings.AccountNames } };
                 File.WriteAllText(settingsPath, json.Serialize(d), new UTF8Encoding(false));
             }
             catch (Exception) { }
@@ -1463,7 +2392,7 @@ namespace AiLimitWidget
             catch (Exception) { }
         }
 
-        static string PlanName(string type, string tier)
+        internal static string PlanName(string type, string tier)
         {
             if (string.IsNullOrEmpty(type)) return "";
             string name = char.ToUpper(type[0], Inv) + type.Substring(1);
@@ -1478,6 +2407,7 @@ namespace AiLimitWidget
             Fetch();
             FetchAgy();
             FetchCodex();
+            providersScan = DateTime.MinValue;
             SyncProviders();
             foreach (var x in extras) FetchExtra(x);
             CheckReturn(true);   // заодно — не вошли ли снова в скрытые после выхода сервисы
@@ -1549,7 +2479,7 @@ namespace AiLimitWidget
             return null;
         }
 
-        static Limit ReadLimit(Dictionary<string, object> d, string key, string title)
+        internal static Limit ReadLimit(Dictionary<string, object> d, string key, string title)
         {
             var o = Get(d, key) as Dictionary<string, object>;
             if (o == null || Get(o, "utilization") == null) return null;
@@ -1618,7 +2548,7 @@ namespace AiLimitWidget
         static string AgyDir { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".gemini", "antigravity-cli"); } }
 
         // выполняет «agy -p <команда> --output-format json»; null — agy не найден или не ответил
-        static string RunAgy(string command, out bool missing)
+        internal static string RunAgy(string command, out bool missing)
         {
             missing = false;
             try
@@ -1666,68 +2596,39 @@ namespace AiLimitWidget
             {
                 if (!NetUp()) { dispatcher.BeginInvoke(new Action(AgyOffline)); return; }
                 bool missing = false;
-                string quota = null, credits = null, aceEmail = null;
-                List<string[]> extra = null;
-                string ace = AceAccounts ? RunAce() : null;
-                if (ace == null || !ParseAce(ace, out quota, out credits, out aceEmail, out extra))
+                string quota = null, credits = null, accEmail = null;
+                List<string> accounts = null;
+                try { accounts = AgyAccounts.Prepare(); } catch (Exception) { accounts = new List<string>(); }
+                if (accounts == null) { dispatcher.BeginInvoke(new Action(AgyBusy)); return; }
+                if (AgyAccounts.IsAdding) { dispatcher.BeginInvoke(new Action(AgyWaitAdding)); return; }
+                if (accounts.Count > 1)
                 {
-                    extra = null;
+                    // несколько аккаунтов: основной опрашиваем внутри блокировки AgyAccounts, чтобы не прочитать чужой вход
+                    string[] r = null;
+                    try
+                    {
+                        r = AgyAccounts.Use(accounts[0], () =>
+                        {
+                            bool m, ignored;
+                            string q = RunAgy("/quota", out m);
+                            return new[] { q, q == null ? null : RunAgy("/credits", out ignored) };
+                        });
+                    }
+                    catch (Exception) { }
+                    if (r == null) { dispatcher.BeginInvoke(new Action(AgyBusy)); return; }
+                    quota = r[0]; credits = r[1]; accEmail = accounts[0];
+                }
+                else
+                {
                     quota = RunAgy("/quota", out missing);
                     bool ignored;
                     credits = quota == null ? null : RunAgy("/credits", out ignored);
                 }
                 // сеть пропала, пока agy работал, — его «нет входа» не верим
                 if (!missing && !NetUp()) { dispatcher.BeginInvoke(new Action(AgyOffline)); return; }
-                string email = aceEmail ?? ReadAgyEmail();
-                dispatcher.BeginInvoke(new Action(() => FetchAgyDone(quota, credits, email, missing, extra)));
+                string email = accEmail ?? AgyAccounts.LiveEmail() ?? ReadAgyEmail();
+                dispatcher.BeginInvoke(new Action(() => FetchAgyDone(quota, credits, email, missing)));
             });
-        }
-
-        // Несколько аккаунтов Antigravity: agy хранит вход в диспетчере учётных данных Windows — один на пользователя.
-        // Скилл ace (~/.claude/skills/ace) сохраняет входы аккаунтов и подставляет нужный на время запроса, поэтому
-        // при аккаунтах в его config.json лимиты всех аккаунтов берём через «ace widget» (тоже /quota, 0 токенов).
-        static string AceScript { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "skills", "ace", "bin", "ace"); } }
-
-        static bool AceAccounts
-        {
-            get
-            {
-                try
-                {
-                    string cfg = Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(AceScript)), "config.json");
-                    return File.Exists(AceScript) && File.Exists(cfg) && File.ReadAllText(cfg).Contains("\"account\"");
-                }
-                catch (Exception) { return false; }
-            }
-        }
-
-        static string RunAce()
-        {
-            var env = new Dictionary<string, string> { { "AGY_CLI_DISABLE_AUTO_UPDATE", "true" }, { "PYTHONIOENCODING", "utf-8" } };
-            foreach (string py in new[] { "python", "py" })
-                try { return Background.Run(py, "\"" + AceScript + "\" widget", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 180000, env); }
-                catch (System.ComponentModel.Win32Exception) { }   // нет такой команды — пробуем следующую
-                catch (Exception) { return null; }
-            return null;
-        }
-
-        // ответ «ace widget»: { "accounts": [ { "label", "email", "quota", "credits", "busy" }, … ] } — первый аккаунт основной
-        bool ParseAce(string text, out string quota, out string credits, out string email, out List<string[]> extra)
-        {
-            quota = credits = email = null;
-            extra = new List<string[]>();
-            try
-            {
-                var list = (Get(json.DeserializeObject(text) as Dictionary<string, object>, "accounts") as System.Collections.IEnumerable)
-                    .OfType<Dictionary<string, object>>().ToList();
-                if (list.Count == 0) return false;
-                Func<Dictionary<string, object>, string, string> str = (a, k) => Convert.ToString(Get(a, k), Inv);
-                quota = str(list[0], "quota"); credits = str(list[0], "credits"); email = str(list[0], "email");
-                if (string.IsNullOrEmpty(email)) email = null;
-                foreach (var a in list.Skip(1)) extra.Add(new[] { str(a, "label"), str(a, "email"), str(a, "quota"), str(a, "credits") });
-                return !string.IsNullOrEmpty(quota);
-            }
-            catch (Exception) { return false; }
         }
 
         // Есть ли интернет: после включения или выхода из сна сеть появляется не сразу.
@@ -1739,6 +2640,54 @@ namespace AiLimitWidget
         }
 
         // сети пока нет: старые данные оставляем, повторяем через минуту
+        // аккаунт занят запуском ace — цифры не трогаем, повторим через минуту
+        void AgyBusy()
+        {
+            agyFetching = false;
+            UpdateSpin();
+            agyNextFetch = DateTime.Now.AddMinutes(1);
+            if (agyGroups.Count == 0) { SetAgyStatus(BusyText, false); UpdateView(); }
+        }
+
+        const string BusyText = "Antigravity занят задачей ace — обновлю, как освободится";
+
+        // идёт вход в новый аккаунт: agy пока без входа — раздел не трогаем, проверяем чаще
+        void AgyWaitAdding()
+        {
+            agyFetching = false;
+            UpdateSpin();
+            agyNextFetch = DateTime.Now.AddSeconds(15);
+            SetAgyStatus(AddingText, false);
+            UpdateView();
+        }
+
+        // меню «Добавить аккаунт» → Antigravity: текущий вход запоминаем и открываем agy с /logout —
+        // в нём входят другим аккаунтом (/login); виджет сам сохранит новый вход и вернёт прежний
+        void AddAgyAccount()
+        {
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                bool ok = false;
+                try
+                {
+                    ok = AgyAccounts.StartAdding();
+                    if (ok)
+                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(AgyExe, "-i /logout") {
+                            UseShellExecute = true, WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) });
+                }
+                catch (Exception) { }
+                dispatcher.BeginInvoke(new Action(() =>
+                {
+                    SetAgyStatus(ok ? AddingText : "Не удалось начать: Antigravity занят или в нём нет входа", !ok);
+                    agyNextFetch = DateTime.Now.AddSeconds(20);
+                    if (!window.IsVisible) ShowWidget();
+                    UpdateView();
+                }));
+            });
+        }
+
+        const string AddingText = "В открывшемся окне Antigravity выполните /login и войдите другим аккаунтом, потом закройте окно";
+
         void AgyOffline()
         {
             agyFetching = false;
@@ -1749,15 +2698,16 @@ namespace AiLimitWidget
             UpdateView();
         }
 
-        void FetchAgyDone(string quota, string credits, string email, bool missing, List<string[]> extra)
+        void FetchAgyDone(string quota, string credits, string email, bool missing)
         {
-            if (extra != null) { agyExtra.Clear(); agyExtra.AddRange(extra); }
             agyFetching = false;
             UpdateSpin();
             agyMissing = missing;
             agyNoAuth = false;
             agyChecked = true;
-            if (email != null) agyEmail = email;
+            if (email != null) { agyEmail = email; Extra.MainAgyEmail = email; }
+            providersScan = DateTime.MinValue;
+            SyncProviders();
             string problem = null;
             if (missing) { SetAgyStatus("", false); agyNextFetch = DateTime.Now.AddMinutes(10); }
             else if (quota != null && ParseAgy(quota, out problem))
@@ -1769,7 +2719,7 @@ namespace AiLimitWidget
                 try
                 {
                     File.WriteAllText(agyCachePath, json.Serialize(new Dictionary<string, object> {
-                        { "At", agyUpdatedAt.Value.ToString("o", Inv) }, { "Body", quota }, { "Credits", credits }, { "Email", agyEmail }, { "Extra", agyExtra } }), new UTF8Encoding(false));
+                        { "At", agyUpdatedAt.Value.ToString("o", Inv) }, { "Body", quota }, { "Credits", credits }, { "Email", agyEmail } }), new UTF8Encoding(false));
                 }
                 catch (Exception) { }
                 CheckNotifications();
@@ -1782,7 +2732,7 @@ namespace AiLimitWidget
 
         void SetAgyStatus(string text, bool error) { agyStatus = text; agyStatusIsError = error; }
 
-        const string AgyNoAuthText = "Нет входа в Antigravity";
+        internal const string AgyNoAuthText = "Нет входа в Antigravity";
 
         // «Gemini Models» → «Gemini», «Claude and GPT models» → «Claude и GPT»
         static string AgyTitle(string key, string name)
@@ -1792,29 +2742,22 @@ namespace AiLimitWidget
             return (name ?? key).Replace(" Models", "").Replace(" models", "").Replace(" and ", " и ");
         }
 
-        // все аккаунты: основной и agyExtra; у второго и следующих ключи групп с «@N»
         bool ParseAgy(string text, out string problem)
         {
-            var list = AgyGroupsOf(text, 1, out problem);
+            var list = AgyGroupsOf(text, out problem);
             if (list == null) return false;
-            for (int i = 0; i < agyExtra.Count; i++)
-            {
-                string ignored;
-                var more = AgyGroupsOf(agyExtra[i][2], i + 2, out ignored);
-                if (more != null) list.AddRange(more);
-            }
             agyGroups.Clear();
             agyGroups.AddRange(list);
             RememberAgyKeys();
             return true;
         }
 
-        List<AgyGroup> AgyGroupsOf(string text, int account, out string problem)
+        internal static List<AgyGroup> AgyGroupsOf(string text, out string problem)
         {
             problem = null;
             try
             {
-                var d = json.DeserializeObject(text) as Dictionary<string, object>;
+                var d = new JavaScriptSerializer().DeserializeObject(text) as Dictionary<string, object>;
                 if (d == null) return null;
                 if (Convert.ToString(Get(d, "status"), Inv) != "SUCCESS")
                 {
@@ -1849,14 +2792,11 @@ namespace AiLimitWidget
                         }
                         var l = new Limit { Key = id, Percent = Math.Max(0, Math.Min(100, (1 - Convert.ToDouble(Get(b, "remaining_fraction"), Inv)) * 100)),
                                             ResetsAt = ParseTime(Get(b, "reset_time")) };
-                        if (window == "5h") { l.Title = "5 часов"; g.Session = l; }
-                        else if (window == "weekly") { l.Title = "Неделя"; g.Week = l; }
+                        if (window == "5h") { l.Title = "5 часов"; l.WindowSeconds = 18000; g.Session = l; }
+                        else if (window == "weekly") { l.Title = "Неделя"; l.WindowSeconds = 604800; g.Week = l; }
                     }
                     if (g.Key == null) g.Key = Convert.ToString(Get(gr, "name"), Inv);
-                    g.Title = g.Name = AgyTitle(g.Key, Convert.ToString(Get(gr, "name"), Inv));
-                    g.Account = account;
-                    if (agyExtra.Count > 0) g.Title += " · акк. " + account;
-                    if (account > 1) g.Key += "@" + account;
+                    g.Title = AgyTitle(g.Key, Convert.ToString(Get(gr, "name"), Inv));
                     if (g.Session != null) g.Session.Title = g.Title + " · 5 ч";
                     if (g.Week != null) g.Week.Title = g.Title + " · неделя";
                     list.Add(g);
@@ -1872,25 +2812,16 @@ namespace AiLimitWidget
             if (c.HasValue) agyCredits = c;
         }
 
-        double? CreditsOf(string text)
+        internal static double? CreditsOf(string text)
         {
             try
             {
-                var d = text == null ? null : json.DeserializeObject(text) as Dictionary<string, object>;
+                var d = text == null ? null : new JavaScriptSerializer().DeserializeObject(text) as Dictionary<string, object>;
                 var data = Get(Get(d, "command") as Dictionary<string, object>, "data") as Dictionary<string, object>;
                 object c = Get(data, "remaining_credits");
                 return c == null ? (double?)null : Convert.ToDouble(c, Inv);
             }
             catch (Exception) { return null; }
-        }
-
-        // строка над группами аккаунта, когда аккаунтов несколько: «Аккаунт 2 · почта · кредиты: 50»
-        string AgyAccountLine(int account)
-        {
-            string email = account == 1 ? agyEmail : agyExtra[account - 2][1];
-            double? credits = account == 1 ? null : CreditsOf(agyExtra[account - 2][3]);
-            return string.Join(" · ", new[] { "Аккаунт " + account, email,
-                credits.HasValue && credits.Value > 0 ? "кредиты: " + Math.Round(credits.Value) : null }.Where(x => !string.IsNullOrEmpty(x)));
         }
 
         // почту Antigravity пишет в свой журнал при входе: «applyAuthResult: email=…»
@@ -1917,15 +2848,12 @@ namespace AiLimitWidget
             {
                 if (!File.Exists(agyCachePath)) return;
                 var d = json.DeserializeObject(File.ReadAllText(agyCachePath, Encoding.UTF8)) as Dictionary<string, object>;
-                var extra = Get(d, "Extra") as System.Collections.IEnumerable;
-                if (extra != null)
-                    foreach (var x in extra.OfType<System.Collections.IEnumerable>())
-                        agyExtra.Add(x.Cast<object>().Select(v => Convert.ToString(v, Inv)).ToArray());
                 string problem;
                 if (ParseAgy(Convert.ToString(Get(d, "Body"), Inv), out problem))
                     agyUpdatedAt = DateTime.Parse(Convert.ToString(Get(d, "At"), Inv), Inv, DateTimeStyles.RoundtripKind);
                 ParseAgyCredits(Convert.ToString(Get(d, "Credits"), Inv));
                 agyEmail = Convert.ToString(Get(d, "Email"), Inv);
+                if (!string.IsNullOrEmpty(agyEmail)) Extra.MainAgyEmail = agyEmail;
             }
             catch (Exception) { }
         }
@@ -1933,7 +2861,7 @@ namespace AiLimitWidget
         // ---------- данные Codex ----------
         // Вход Codex хранит в ~/.codex/auth.json (вход через ChatGPT); виджет его только читает.
         // Лимиты — тот же запрос, что делает /status в самом Codex.
-        const string CodexUsageUrl = "https://chatgpt.com/backend-api/wham/usage";
+        internal const string CodexUsageUrl = "https://chatgpt.com/backend-api/wham/usage";
         readonly string codexCachePath;
         readonly List<Limit> codexLimits = new List<Limit>();
         string codexPlan = "", codexEmail, codexStatus = "";
@@ -1942,7 +2870,7 @@ namespace AiLimitWidget
         DateTime? codexUpdatedAt;
         DateTime codexNextFetch = DateTime.MinValue;
 
-        static string CodexAuthPath
+        internal static string CodexAuthPath
         {
             get
             {
@@ -2046,7 +2974,7 @@ namespace AiLimitWidget
         void SetCodexStatus(string text, bool error) { codexStatus = text; codexStatusIsError = error; }
 
         // 18000 с → «Сессия (5 ч)», 604800 → «Неделя», 2592000 → «30 дней»
-        static string WindowTitle(long seconds)
+        internal static string WindowTitle(long seconds)
         {
             if (seconds <= 0) return "Лимит";
             if (seconds <= 24 * 3600) return "Сессия (" + Math.Round(seconds / 3600.0) + " ч)";
@@ -2099,29 +3027,71 @@ namespace AiLimitWidget
         Limit CodexShort { get { return codexLimits.FirstOrDefault(l => l.WindowSeconds <= 24 * 3600); } }
         Limit CodexLong { get { return codexLimits.LastOrDefault(l => l.WindowSeconds > 24 * 3600); } }
 
-        // ---------- данные других ИИ ----------
+        // ---------- данные других ИИ и дополнительных аккаунтов ----------
         // Вход не нашли — раздел не показываем и проверяем раз в несколько минут: вдруг войдут.
         readonly List<ExtraProvider> extras = Extra.All.Select(x => new ExtraProvider { Key = x[0], Name = x[1], Color = C(x[2]) }).ToList();
 
         ExtraProvider ExtraFor(string key) { return extras.FirstOrDefault(x => x.Key == key); }
 
-        // новые файлы в папке providers: ИИ появляется в окне и в меню, а у часов — один раз включается его столбец
-        DateTime providersScan = DateTime.MinValue;
+        // новые файлы в папке providers и папки аккаунтов: раздел появляется в окне и в меню, а у часов — включается его столбец
+        DateTime providersScan = DateTime.MinValue, addingFolderUntil = DateTime.MinValue;
+        string accountNotice = "";
+        bool accountNoticeError;
 
         void SyncProviders()
         {
-            if (DateTime.Now < providersScan) return;   // папку смотрим не чаще раза в 10 с
-            providersScan = DateTime.Now.AddSeconds(10);
+            if (DateTime.Now < providersScan) return;   // папку смотрим не чаще раза в 10 с (при входе в новый аккаунт — раз в 2 с)
+            providersScan = DateTime.Now.AddSeconds(DateTime.Now < addingFolderUntil ? 2 : 10);
+            Extra.MainAgyEmail = agyEmail;
             var found = Extra.ScanProviders();
+            if (Extra.LastDuplicateSvc != null)
+            {
+                string dupSvc = Extra.LastDuplicateSvc;
+                Extra.LastDuplicateSvc = null;
+                ShowAccountNotice(dupSvc, "Этот аккаунт уже есть", true);
+                if (tray != null) tray.ShowBalloonTip(4000, "Этот аккаунт уже есть", Extra.AiName(dupSvc), WinForms.ToolTipIcon.Info);
+            }
+            foreach (var x in extras)
+            {
+                var a = Extra.All.FirstOrDefault(e => e[0] == x.Key);
+                if (a != null) x.Name = a[1];
+            }
+            var removed = extras.Where(x => Extra.All.All(a => a[0] != x.Key)).Select(x => x.Key).ToList();
+            if (removed.Count > 0)
+            {
+                extras.RemoveAll(x => removed.Contains(x.Key));
+                settings.ClockItems = string.Join(",", settings.ClockItems.Split(',').Where(k => k.Length > 0 && !removed.Contains(k)));
+                settings.SeenExtras = string.Join(",", settings.SeenExtras.Split(',').Where(k => k.Length > 0 && !removed.Contains(k)));
+                settings.HiddenExtras = string.Join(",", settings.HiddenExtras.Split(',').Where(k => k.Length > 0 && !removed.Contains(k)));
+                lastTrayKey = null;
+                SaveSettings();
+                UpdateView();
+            }
             if (found.Count == 0) return;
-            foreach (var e in found) extras.Add(new ExtraProvider { Key = e[0], Name = e[1], Color = C(e[2]) });
+            foreach (var e in found)
+            {
+                bool isAcc = e[0].StartsWith("acc-", StringComparison.Ordinal);
+                string def = isAcc ? Extra.GetDefaultLabel(e[0]) : null;
+                extras.Add(new ExtraProvider { Key = e[0], Name = e[1], Color = C(e[2]), SignedIn = isAcc,
+                                               Email = def != null && def.Contains("@") ? def : null });
+                if (isAcc) addingFolderUntil = DateTime.MinValue;
+            }
             var seen = settings.SeenExtras.Split(',').Where(k => k.Length > 0).ToList();
             var fresh = found.Select(e => e[0]).Where(k => !seen.Contains(k)).ToList();
-            if (fresh.Count == 0) return;
-            settings.SeenExtras = string.Join(",", seen.Concat(fresh));
-            var items = settings.ClockItems.Split(',').Where(x => x.Length > 0).Concat(fresh).ToList();
-            settings.ClockItems = string.Join(",", ClockColumns.Select(c => c[0]).Where(items.Contains));
-            SaveSettings();
+            if (fresh.Count > 0)
+            {
+                settings.SeenExtras = string.Join(",", seen.Concat(fresh));
+                var items = settings.ClockItems.Split(',').Where(x => x.Length > 0).Concat(fresh).ToList();
+                settings.ClockItems = string.Join(",", ClockColumns.Select(c => c[0]).Where(items.Contains));
+                SaveSettings();
+            }
+            foreach (var e in found.Where(x => x[0].StartsWith("acc-", StringComparison.Ordinal)))
+            {
+                var ep = ExtraFor(e[0]);
+                if (ep != null) FetchExtra(ep);
+            }
+            lastTrayKey = null;
+            UpdateView();
         }
         bool ExtraOn(string key) { return !settings.HiddenExtras.Split(',').Contains(key); }
         List<ExtraProvider> ShownExtras { get { return extras.Where(x => x.SignedIn && ExtraOn(x.Key)).ToList(); } }
@@ -2138,7 +3108,7 @@ namespace AiLimitWidget
                 try { r = Extra.Fetch(x.Key); }
                 catch (Exception) { r = new ExtraResult { Problem = "Нет соединения — повторю позже" }; }
                 // без сети ответ «входа нет» или ошибка ничего не значат — раздел не прячем, ждём сеть
-                if ((!r.SignedIn || r.Problem != null) && !NetUp())
+                if (!r.Busy && (!r.SignedIn || r.Problem != null) && !NetUp())
                 {
                     dispatcher.BeginInvoke(new Action(() =>
                     {
@@ -2159,6 +3129,14 @@ namespace AiLimitWidget
         void FetchExtraDone(ExtraProvider x, ExtraResult r)
         {
             x.Fetching = false;
+            if (r.Busy)
+            {
+                x.NextFetch = DateTime.Now.AddMinutes(1);
+                if (x.Limits.Count == 0) { x.Status = BusyText; x.StatusIsError = false; }
+                UpdateSpin();
+                UpdateView();
+                return;
+            }
             bool wasShown = x.SignedIn;
             x.SignedIn = r.SignedIn;
             if (!r.SignedIn)
@@ -2172,11 +3150,22 @@ namespace AiLimitWidget
             else
             {
                 if (!string.IsNullOrEmpty(r.Plan)) x.Plan = r.Plan;
-                if (!string.IsNullOrEmpty(r.Email)) x.Email = r.Email;
+                if (!string.IsNullOrEmpty(r.Email))
+                {
+                    x.Email = r.Email;
+                    if (x.Key.StartsWith("acc-", StringComparison.Ordinal))
+                    {
+                        x.Name = Extra.AccountTitle(x.Key, r.Email);
+                        var entry = Extra.All.FirstOrDefault(a => a[0] == x.Key);
+                        if (entry != null) entry[1] = x.Name;
+                    }
+                }
+                x.LongKey = r.LongKey;
                 if (r.Problem == null || r.Limits.Count > 0)
                 {
                     x.Limits.Clear();
                     x.Limits.AddRange(r.Limits);
+                    x.Groups = r.Groups;
                     x.UpdatedAt = DateTime.Now;
                 }
                 x.Status = r.Problem ?? "";
@@ -2196,19 +3185,19 @@ namespace AiLimitWidget
             var all = new List<KeyValuePair<string, Limit>>();
             if (settings.ShowClaude)
             {
-                if (session != null) all.Add(new KeyValuePair<string, Limit>("Claude Code", session));
-                foreach (var w in weekly) all.Add(new KeyValuePair<string, Limit>("Claude Code", w));
+                if (session != null) all.Add(new KeyValuePair<string, Limit>(AccountName("claude", "Claude Code"), session));
+                foreach (var w in weekly) all.Add(new KeyValuePair<string, Limit>(AccountName("claude", "Claude Code"), w));
             }
             if (settings.ShowAgy)
                 foreach (var g in agyGroups)
                 {
-                    if (g.Session != null) all.Add(new KeyValuePair<string, Limit>("Antigravity", g.Session));
-                    if (g.Week != null) all.Add(new KeyValuePair<string, Limit>("Antigravity", g.Week));
+                    if (g.Session != null) all.Add(new KeyValuePair<string, Limit>(AccountName("agy", "Antigravity"), g.Session));
+                    if (g.Week != null) all.Add(new KeyValuePair<string, Limit>(AccountName("agy", "Antigravity"), g.Week));
                 }
             if (settings.ShowCodex)
-                foreach (var l in codexLimits) all.Add(new KeyValuePair<string, Limit>("Codex", l));
+                foreach (var l in codexLimits) all.Add(new KeyValuePair<string, Limit>(AccountName("codex", "Codex"), l));
             foreach (var x in ShownExtras)
-                foreach (var l in x.Limits) all.Add(new KeyValuePair<string, Limit>(x.Name, l));
+                foreach (var l in x.Limits) all.Add(new KeyValuePair<string, Limit>(AccountName(x.Key, x.Name), l));
             foreach (var pair in all)
                 foreach (int t in NotifyThresholds.Reverse())
                 {
@@ -2370,6 +3359,7 @@ namespace AiLimitWidget
             LoadCache();
             LoadAgyCache();
             LoadCodexCache();
+            SyncProviders();
 
             window = (Window)XamlReader.Parse(MainXaml);
             window.Topmost = true;
@@ -2491,6 +3481,11 @@ namespace AiLimitWidget
         void Tick()
         {
             WatchNet();
+            if (waitingSvc != null)
+            {
+                if (DateTime.Now >= waitingUntil) CancelAddAccount();
+                else if (!waitingPolling && DateTime.Now >= waitingNextPoll) PollWaitingAccount();
+            }
             if (DateTime.Now < startDelayUntil || !online) { UpdateView(); return; }
             // окно лимита закончилось — сразу спрашиваем новые данные
             bool expired = session != null && session.ResetsAt.HasValue && session.ResetsAt.Value <= DateTime.Now;
@@ -2555,60 +3550,77 @@ namespace AiLimitWidget
 
             // по разделу на сервис: Claude Code (оранжевый) и Antigravity (синий)
             var rows = Find<StackPanel>("Rows");
-            rows.Children.Clear();
-            if (confirmLogout || loggingOut)
-                rows.Children.Add(LogoutPanel());
+            if (renamingAccount != null && renamePanel != null)
+            {
+                if (rows.Children.Count != 1 || rows.Children[0] != renamePanel)
+                {
+                    rows.Children.Clear();
+                    rows.Children.Add(renamePanel);
+                }
+            }
             else
             {
-                if (ClaudeOn)
+                rows.Children.Clear();
+                if (confirmLogout || loggingOut)
+                    rows.Children.Add(LogoutPanel());
+                else if (choosingAccount)
+                    rows.Children.Add(AccountPanel());
+                else
                 {
-                    rows.Children.Add(ProviderHeader("Claude Code", new[] { Accent }, plan, rows.Children.Count == 0));
-                    if (session == null)
-                        rows.Children.Add(Hint("Загрузка…"));
-                    else
-                        rows.Children.Add(Row(session, now, active ? null : "Не начата — 5-часовое окно начнётся с первого запроса", Accent));
-                    foreach (var l in weekly) rows.Children.Add(Row(l, now, null, Accent));
-                    if (!string.IsNullOrEmpty(status)) rows.Children.Add(StatusLine(status, statusIsError));
-                }
-                if (AgyOn)
-                {
-                    string credits = agyCredits.HasValue && agyCredits.Value > 0 ? "кредиты: " + Math.Round(agyCredits.Value) : null;
-                    var agyColors = agyGroups.Count > 0 ? agyGroups.Select(g => GroupColor(g.Key)).Distinct().ToArray() : new[] { GeminiColor, AgyClaudeColor };
-                    rows.Children.Add(ProviderHeader("Antigravity", agyColors, credits, rows.Children.Count == 0));
-                    if (agyGroups.Count == 0 && string.IsNullOrEmpty(agyStatus))
-                        rows.Children.Add(Hint("Загрузка…"));
-                    int shownAccount = 0;
-                    foreach (var g in agyGroups)
+                    var drawn = new HashSet<string>();   // разделы дополнительных аккаунтов, уже показанные под своим ИИ
+                    if (ClaudeOn)
                     {
-                        if (agyExtra.Count > 0 && g.Account != shownAccount && g.Account - 2 < agyExtra.Count)
-                        {
-                            shownAccount = g.Account;
-                            rows.Children.Add(Hint(AgyAccountLine(g.Account)));
-                        }
-                        rows.Children.Add(AgyRow(g, now));
+                        rows.Children.Add(ProviderHeader(MainTitle("claude", "Claude Code"), new[] { Accent }, plan, rows.Children.Count == 0));
+                        if (session == null)
+                            rows.Children.Add(Hint("Загрузка…"));
+                        else
+                            rows.Children.Add(Row(session, now, active ? null : "Не начата — 5-часовое окно начнётся с первого запроса", Accent));
+                        foreach (var l in weekly) rows.Children.Add(Row(l, now, null, Accent));
+                        if (!string.IsNullOrEmpty(status)) rows.Children.Add(StatusLine(status, statusIsError));
                     }
-                    if (!string.IsNullOrEmpty(agyStatus)) rows.Children.Add(StatusLine(agyStatus, agyStatusIsError));
+                    AddAccountSections(rows, "claude", now, drawn);
+                    if (AgyOn)
+                    {
+                        string credits = agyCredits.HasValue && agyCredits.Value > 0 ? "кредиты: " + Math.Round(agyCredits.Value) : null;
+                        var agyColors = agyGroups.Count > 0 ? agyGroups.Select(g => GroupColor(g.Key)).Distinct().ToArray() : new[] { GeminiColor, AgyClaudeColor };
+                        rows.Children.Add(ProviderHeader(MainTitle("agy", "Antigravity"), agyColors, credits, rows.Children.Count == 0));
+                        if (agyGroups.Count == 0 && string.IsNullOrEmpty(agyStatus))
+                            rows.Children.Add(Hint("Загрузка…"));
+                        foreach (var g in agyGroups)
+                            rows.Children.Add(AgyRow(g, now));
+                        if (!string.IsNullOrEmpty(agyStatus)) rows.Children.Add(StatusLine(agyStatus, agyStatusIsError));
+                    }
+                    AddAccountSections(rows, "agy", now, drawn);
+                    if (CodexOn)
+                    {
+                        rows.Children.Add(ProviderHeader(MainTitle("codex", "Codex"), new[] { CodexColor }, codexPlan, rows.Children.Count == 0));
+                        if (codexLimits.Count == 0 && string.IsNullOrEmpty(codexStatus))
+                            rows.Children.Add(Hint(codexUpdatedAt.HasValue ? "Сервер не сообщил лимиты" : "Загрузка…"));
+                        foreach (var l in codexLimits) rows.Children.Add(Row(l, now, null, CodexColor));
+                        if (!string.IsNullOrEmpty(codexStatus)) rows.Children.Add(StatusLine(codexStatus, codexStatusIsError));
+                    }
+                    AddAccountSections(rows, "codex", now, drawn);
+                    // другие ИИ — только те, в которые вошли; у каждого свой цвет
+                    foreach (var x in ShownExtras.Where(e => !drawn.Contains(e.Key) && !e.Key.StartsWith("acc-", StringComparison.Ordinal)))
+                    {
+                        ExtraSection(rows, x, now);
+                        AddAccountSections(rows, x.Key, now, drawn);
+                    }
+                    // аккаунты ИИ, чей основной раздел скрыт, — в конце
+                    foreach (var x in ShownExtras.Where(e => !drawn.Contains(e.Key) && e.Key.StartsWith("acc-", StringComparison.Ordinal)))
+                        ExtraSection(rows, x, now);
+                    if (waitingSvc != null)
+                        rows.Children.Add(WaitingAccountLine());
+                    if (!string.IsNullOrEmpty(accountNotice))
+                    {
+                        if (now >= accountNoticeUntil) accountNotice = "";
+                        else rows.Children.Add(StatusLine(accountNotice, accountNoticeError));
+                    }
+                    // ни в один ИИ не вошли — просто пояснение, без кнопок входа
+                    if (rows.Children.Count == 0)
+                        rows.Children.Add(Hint(AnyFetching || !agyChecked ? "Ищем ИИ, в которые вы вошли…"
+                            : "На этом компьютере нет входа ни в один ИИ.\nВойдите в Claude Code, Codex, Gemini CLI или Antigravity — лимиты появятся здесь сами."));
                 }
-                if (CodexOn)
-                {
-                    rows.Children.Add(ProviderHeader("Codex", new[] { CodexColor }, codexPlan, rows.Children.Count == 0));
-                    if (codexLimits.Count == 0 && string.IsNullOrEmpty(codexStatus))
-                        rows.Children.Add(Hint(codexUpdatedAt.HasValue ? "Сервер не сообщил лимиты" : "Загрузка…"));
-                    foreach (var l in codexLimits) rows.Children.Add(Row(l, now, null, CodexColor));
-                    if (!string.IsNullOrEmpty(codexStatus)) rows.Children.Add(StatusLine(codexStatus, codexStatusIsError));
-                }
-                // другие ИИ — только те, в которые вошли; у каждого свой цвет
-                foreach (var x in ShownExtras)
-                {
-                    rows.Children.Add(ProviderHeader(x.Name, new[] { x.Color }, x.Plan, rows.Children.Count == 0));
-                    if (x.Limits.Count == 0 && string.IsNullOrEmpty(x.Status)) rows.Children.Add(Hint("Загрузка…"));
-                    foreach (var l in x.Limits) rows.Children.Add(Row(l, now, null, x.Color));
-                    if (!string.IsNullOrEmpty(x.Status)) rows.Children.Add(StatusLine(x.Status, x.StatusIsError));
-                }
-                // ни в один ИИ не вошли — просто пояснение, без кнопок входа
-                if (rows.Children.Count == 0)
-                    rows.Children.Add(Hint(AnyFetching || !agyChecked ? "Ищем ИИ, в которые вы вошли…"
-                        : "На этом компьютере нет входа ни в один ИИ.\nВойдите в Claude Code, Codex, Gemini CLI или Antigravity — лимиты появятся здесь сами."));
             }
 
             // подпись: когда обновлялось (по самому свежему из сервисов)
@@ -2627,7 +3639,7 @@ namespace AiLimitWidget
             Find<Grid>("Body").Margin = preview ? new Thickness(14, 2, 12, 12) : new Thickness(14, 12, 12, 14);
             var details = Find<StackPanel>("Details");
             details.Visibility = preview ? Visibility.Collapsed : Visibility.Visible;
-            if (window.IsVisible && !preview && !confirmLogout && !loggingOut) BuildDetails(details, now);
+            if (window.IsVisible && !preview && !confirmLogout && !loggingOut && !choosingAccount && renamingAccount == null) BuildDetails(details, now);
             else details.Children.Clear();
 
             UpdateTray(pct, active);
@@ -2669,12 +3681,12 @@ namespace AiLimitWidget
             var dots = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 1, 7, 0) };
             for (int i = 0; i < colors.Length; i++) dots.Children.Add(Dot(colors[i], 8, new Thickness(i == 0 ? 0 : -2, 0, 0, 0)));   // точки чуть внахлёст
             g.Children.Add(dots);
-            var title = new TextBlock { Text = name, FontSize = 13, FontWeight = FontWeights.SemiBold, Foreground = B("#F5F5F7") };
+            var title = new TextBlock { Text = name, FontSize = 13, FontWeight = FontWeights.SemiBold, Foreground = B("#F5F5F7"), TextTrimming = TextTrimming.CharacterEllipsis };
             Grid.SetColumn(title, 1);
             g.Children.Add(title);
             if (!string.IsNullOrEmpty(note))
             {
-                var right = new TextBlock { Text = note, FontSize = 11, Foreground = B("#8E8E93"), VerticalAlignment = VerticalAlignment.Center };
+                var right = new TextBlock { Text = note, FontSize = 11, Foreground = B("#8E8E93"), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) };
                 Grid.SetColumn(right, 2);
                 g.Children.Add(right);
             }
@@ -2683,16 +3695,106 @@ namespace AiLimitWidget
         }
 
         // группа Antigravity: название и две полосы рядом — 5 часов и неделя
-        UIElement AgyRow(AgyGroup g, DateTime now)
+        // раздел другого ИИ или дополнительного аккаунта; у аккаунта Antigravity — группы, как в основном разделе
+        void ExtraSection(StackPanel rows, ExtraProvider x, DateTime now)
+        {
+            bool groups = x.Groups != null && x.Groups.Count > 0;
+            var colors = groups ? x.Groups.Select(g => Lighter(GroupColor(g.Key))).Distinct().ToArray() : new[] { x.Color };
+            string title = x.Key.StartsWith("acc-", StringComparison.Ordinal) ? x.Name : MainTitle(x.Key, x.Name);
+            rows.Children.Add(ProviderHeader(title, colors, x.Plan, rows.Children.Count == 0));
+            if (x.Limits.Count == 0 && string.IsNullOrEmpty(x.Status)) rows.Children.Add(Hint("Загрузка…"));
+            if (groups)
+                foreach (var g in x.Groups) rows.Children.Add(AgyRow(g, now, true));
+            else
+                foreach (var l in x.Limits) rows.Children.Add(Row(l, now, null, x.Color));
+            if (!string.IsNullOrEmpty(x.Status)) rows.Children.Add(StatusLine(x.Status, x.StatusIsError));
+        }
+
+        static bool SameSvc(string s, string svc) { return s != null && (s == svc || "p-" + s == svc || s == "p-" + svc); }
+
+        // есть ли у ИИ svc дополнительные аккаунты
+        bool HasAccounts(string svc)
+        {
+            return extras.Any(e => e.Key.StartsWith("acc-", StringComparison.Ordinal) && SameSvc(Extra.AccountSvc(e.Key), svc));
+        }
+
+        // почта основного аккаунта ИИ
+        string MainEmail(string svc)
+        {
+            if (svc == "claude") return Acc("emailAddress");
+            if (svc == "agy") return agyEmail;
+            if (svc == "codex") return codexEmail;
+            var x = ExtraFor(svc);
+            return x == null ? null : x.Email;
+        }
+
+        // заголовок основного раздела: пока аккаунт один — просто имя ИИ, когда их несколько — «ИИ · почта» (или своё название),
+        // как у дополнительных аккаунтов
+        string MainTitle(string svc, string ai)
+        {
+            if (!HasAccounts(svc)) return ai;
+            string custom;
+            settings.AccountNames.TryGetValue("main-" + svc, out custom);
+            string label = !string.IsNullOrEmpty(custom) ? custom : MainEmail(svc);
+            return string.IsNullOrEmpty(label) ? ai : ai + " · " + label;
+        }
+
+        // название аккаунта слева в списках: имя ИИ и (если переименован) своё имя аккаунта, без почты
+        string AccountName(string key, string ai)
+        {
+            bool acc = key.StartsWith("acc-", StringComparison.Ordinal);
+            string prefix = acc ? (Extra.AccountPrefix(key) ?? ai) : ai;
+            string custom = Extra.GetCustomName(acc ? key : "main-" + key);
+            return string.IsNullOrEmpty(custom) ? prefix : prefix + " · " + custom;
+        }
+
+        // тариф дополнительного аккаунта или другого ИИ в блоке «Аккаунты» — так же, как у основных
+        static string AccountPlan(ExtraProvider x)
+        {
+            if (string.IsNullOrEmpty(x.Plan)) return null;
+            string svc = Extra.AccountSvc(x.Key);
+            if (svc == "claude") return "Claude " + x.Plan;
+            if (svc == "codex") return "ChatGPT " + x.Plan;
+            if (svc == "agy") return null;
+            return x.Plan;
+        }
+
+        // короткое имя для подсказки в трее (63 символа): своё имя или «Antigravity 2», без почты
+        string TrayExtraName(ExtraProvider x)
+        {
+            if (!x.Key.StartsWith("acc-", StringComparison.Ordinal)) return x.Name;
+            string custom = Extra.GetCustomName(x.Key);
+            if (!string.IsNullOrEmpty(custom)) return custom;
+            string svc = Extra.AccountSvc(x.Key);
+            string prefix = Extra.AccountPrefix(x.Key) ?? x.Name;
+            int idx = extras.Where(e => e.Key.StartsWith("acc-", StringComparison.Ordinal) && SameSvc(Extra.AccountSvc(e.Key), svc)).ToList().IndexOf(x);
+            return prefix + " " + (idx >= 0 ? idx + 2 : 2).ToString(Inv);
+        }
+
+        // дополнительные аккаунты ИИ svc — сразу под его основным разделом
+        void AddAccountSections(StackPanel rows, string svc, DateTime now, HashSet<string> drawn)
+        {
+            foreach (var x in ShownExtras.Where(e => e.Key.StartsWith("acc-", StringComparison.Ordinal) && !drawn.Contains(e.Key)))
+            {
+                if (!SameSvc(Extra.AccountSvc(x.Key), svc)) continue;
+                ExtraSection(rows, x, now);
+                drawn.Add(x.Key);
+            }
+        }
+
+        UIElement AgyRow(AgyGroup g, DateTime now) { return AgyRow(g, now, false); }
+
+        // lighter — группа второго аккаунта: тот же вид, цвет светлее
+        UIElement AgyRow(AgyGroup g, DateTime now, bool lighter)
         {
             var panel = new StackPanel { Margin = new Thickness(0, 10, 0, 0) };
-            Color color = GroupColor(g.Key);
+            Color color = lighter ? Lighter(GroupColor(g.Key)) : GroupColor(g.Key);
             var head = new Grid();
             head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             head.ColumnDefinitions.Add(new ColumnDefinition());
             head.Children.Add(Dot(color, 6, new Thickness(0, 1, 6, 0)));
-            var title = new TextBlock { Text = agyExtra.Count > 0 ? g.Name ?? g.Title : g.Title, FontSize = 12.5, Foreground = B("#D1D1D6") };
+            var title = new TextBlock { Text = g.Title, FontSize = 12.5, Foreground = B("#D1D1D6") };
             Grid.SetColumn(title, 1);
             head.Children.Add(title);
             if (!string.IsNullOrEmpty(g.Models))
@@ -2820,13 +3922,10 @@ namespace AiLimitWidget
             // аккаунты: почта и тариф; одинаковая почта у всех — одной строкой сверху
             bool claudeOn = ClaudeOn, agyOn = AgyOn, codexOn = CodexOn;
             var accounts = new List<Tuple<Color, string, string, string>>();   // цвет, сервис, почта, тариф
-            if (claudeOn) accounts.Add(Tuple.Create(Accent, "Claude Code", Acc("emailAddress"), plan.Length > 0 ? "Claude " + plan : null));
-            if (agyOn) accounts.Add(Tuple.Create(GeminiColor, agyExtra.Count > 0 ? "Antigravity 1" : "Antigravity", agyEmail, (string)null));
-            if (agyOn)
-                for (int i = 0; i < agyExtra.Count; i++)
-                    accounts.Add(Tuple.Create(GroupColor("gemini@" + (i + 2)), "Antigravity " + (i + 2), agyExtra[i][1], (string)null));
-            if (codexOn) accounts.Add(Tuple.Create(CodexColor, "Codex", codexEmail, codexPlan.Length > 0 ? "ChatGPT " + codexPlan : null));
-            foreach (var x in ShownExtras) accounts.Add(Tuple.Create(x.Color, x.Name, x.Email, x.Plan.Length > 0 ? x.Plan : null));
+            if (claudeOn) accounts.Add(Tuple.Create(Accent, AccountName("claude", "Claude Code"), Acc("emailAddress"), plan.Length > 0 ? "Claude " + plan : null));
+            if (agyOn) accounts.Add(Tuple.Create(GeminiColor, AccountName("agy", "Antigravity"), agyEmail, (string)null));
+            if (codexOn) accounts.Add(Tuple.Create(CodexColor, AccountName("codex", "Codex"), codexEmail, codexPlan.Length > 0 ? "ChatGPT " + codexPlan : null));
+            foreach (var x in ShownExtras) accounts.Add(Tuple.Create(x.Color, AccountName(x.Key, x.Name), x.Email, AccountPlan(x)));
             var emails = accounts.Select(a => a.Item3).Where(e => !string.IsNullOrEmpty(e)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             bool oneEmail = emails.Count == 1;
             Section(panel, "Аккаунты");
@@ -2841,14 +3940,14 @@ namespace AiLimitWidget
             // на что ушла неделя: разбивку по продуктам присылает только Claude, у остальных — недельный расход целиком
             var week = new List<Tuple<Color, string, double>>();
             if (claudeOn)
-                foreach (var b in breakdown.Where(b => b.Value >= 0.5)) week.Add(Tuple.Create(Accent, "Claude · " + b.Key, b.Value));
+                foreach (var b in breakdown.Where(b => b.Value >= 0.5)) week.Add(Tuple.Create(Accent, AccountName("claude", "Claude") + " · " + b.Key, b.Value));
             if (agyOn)
                 foreach (var g in agyGroups.Where(g => g.Week != null)) week.Add(Tuple.Create(GroupColor(g.Key), g.Title + " · лимит", Current(g.Week, now)));
-            if (codexOn && CodexLong != null) week.Add(Tuple.Create(CodexColor, "Codex · " + CodexLong.Title.ToLower(Ru), Current(CodexLong, now)));
+            if (codexOn && CodexLong != null) week.Add(Tuple.Create(CodexColor, AccountName("codex", "Codex") + " · " + CodexLong.Title.ToLower(Ru), Current(CodexLong, now)));
             foreach (var x in ShownExtras)
             {
                 Limit l = x.Long ?? x.Short;
-                if (l != null) week.Add(Tuple.Create(x.Color, x.Name + " · " + l.Title.ToLower(Ru), Current(l, now)));
+                if (l != null) week.Add(Tuple.Create(x.Color, AccountName(x.Key, x.Name) + " · " + l.Title.ToLower(Ru), Current(l, now)));
             }
             if (week.Count > 0)
             {
@@ -2877,7 +3976,14 @@ namespace AiLimitWidget
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             g.ColumnDefinitions.Add(new ColumnDefinition());
             g.Children.Add(Dot(color, 6, new Thickness(0, 1, 6, 0)));
-            var name = new TextBlock { Text = label, FontSize = 12, Foreground = B("#AEAEB2") };
+            bool shortRight = (value ?? "").Length <= 6;
+            if (shortRight)
+            {
+                g.ColumnDefinitions[1].Width = new GridLength(1, GridUnitType.Star);
+                g.ColumnDefinitions[2].Width = GridLength.Auto;
+            }
+            var name = new TextBlock { Text = label, FontSize = 12, Foreground = B("#AEAEB2"), TextTrimming = TextTrimming.CharacterEllipsis };
+            if (!shortRight) name.MaxWidth = 150;
             Grid.SetColumn(name, 1);
             g.Children.Add(name);
             var v = new TextBlock { Text = value, FontSize = 12, FontWeight = FontWeights.SemiBold, Foreground = B("#F5F5F7"),
@@ -3000,6 +4106,10 @@ namespace AiLimitWidget
         {
             preview = false;
             confirmLogout = false;
+            choosingAccount = false;
+            renamingAccount = null;
+            renamePanel = null;
+            renameBox = null;
             HookMouse(false);
             window.Hide();
             hiddenAt = DateTime.Now;
@@ -3071,11 +4181,11 @@ namespace AiLimitWidget
             if (settings.ShowClaude && session != null) tip.Add("Claude " + Math.Round(pct) + "%" + (weekly.Count > 0 ? " (нед. " + Math.Round(Current(weekly[0], now)) + "%)" : ""));
             if (settings.ShowAgy)
                 foreach (var gr in agyGroups)
-                    tip.Add((gr.Key.StartsWith("3p") ? "Claude/GPT" : gr.Name ?? gr.Title) + (gr.Account > 1 ? " #" + gr.Account : "") + " " + Math.Round(Current(gr.Short, now)) + "%");
+                    tip.Add((gr.Key.StartsWith("3p") ? "Claude/GPT" : gr.Title) + " " + Math.Round(Current(gr.Short, now)) + "%");
             if (settings.ShowCodex && codexLimits.Count > 0) tip.Add("Codex " + Math.Round(Current(codexLimits[0], now)) + "%");
-            foreach (var x in ShownExtras) if (x.Short != null) tip.Add(x.Name + " " + Math.Round(Current(x.Short, now)) + "%");
+            foreach (var x in ShownExtras) if (x.Short != null) tip.Add(TrayExtraName(x) + " " + Math.Round(Current(x.Short, now)) + "%");
             string text63 = tip.Count == 0 ? "Лимиты ИИ" : string.Join(" · ", tip);
-            tray.Text = text63.Length > 63 ? text63.Substring(0, 63) : text63;
+            tray.Text = text63.Length > 63 ? text63.Substring(0, 62) + "…" : text63;
 
             // главное число — сессия Claude; если Claude скрыт — сессия Antigravity
             bool claudeMain = ClaudeOn;
@@ -3168,12 +4278,12 @@ namespace AiLimitWidget
     <Setter Property='Template'>
       <Setter.Value>
         <ControlTemplate TargetType='MenuItem'>
-          <Border x:Name='Bd' Background='Transparent' CornerRadius='4' MinHeight='32' MinWidth='230' Padding='0,0,12,0'>
+          <Border x:Name='Bd' Background='Transparent' CornerRadius='4' MinHeight='32' MinWidth='230' MaxWidth='340' Padding='0,0,12,0'>
             <Grid>
               <Grid.ColumnDefinitions><ColumnDefinition Width='34'/><ColumnDefinition/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
               <TextBlock x:Name='Check' Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='12'
                          HorizontalAlignment='Center' VerticalAlignment='Center' Visibility='Hidden'/>
-              <ContentPresenter Grid.Column='1' ContentSource='Header' VerticalAlignment='Center' RecognizesAccessKey='False'/>
+              <TextBlock Grid.Column='1' Text='{TemplateBinding Header}' VerticalAlignment='Center' TextTrimming='CharacterEllipsis'/>
               <TextBlock x:Name='Arrow' Grid.Column='2' Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='10'
                          VerticalAlignment='Center' Margin='16,0,0,0' Visibility='Collapsed'/>
               <Popup x:Name='PART_Popup' Placement='Right' HorizontalOffset='-6' VerticalOffset='-15' AllowsTransparency='True' Focusable='False'
@@ -3303,11 +4413,11 @@ namespace AiLimitWidget
             menu.Items.Add(new Separator());
             menu.Items.Add(Sub("Показывать",
                 new[] {
-                    ClaudeAvail ? ServiceToggle("Claude Code", settings.ShowClaude, v => { settings.ShowClaude = v; SetLoggedOut("claude", false); }, Fetch) : null,
-                    AgyAvail ? ServiceToggle("Antigravity", settings.ShowAgy, v => { settings.ShowAgy = v; SetLoggedOut("agy", false); }, FetchAgy) : null,
-                    CodexAvail ? ServiceToggle("Codex", settings.ShowCodex, v => { settings.ShowCodex = v; SetLoggedOut("codex", false); }, FetchCodex) : null }
+                    ClaudeAvail ? ServiceToggle(MainTitle("claude", "Claude Code"), settings.ShowClaude, v => { settings.ShowClaude = v; SetLoggedOut("claude", false); }, Fetch) : null,
+                    AgyAvail ? ServiceToggle(MainTitle("agy", "Antigravity"), settings.ShowAgy, v => { settings.ShowAgy = v; SetLoggedOut("agy", false); }, FetchAgy) : null,
+                    CodexAvail ? ServiceToggle(MainTitle("codex", "Codex"), settings.ShowCodex, v => { settings.ShowCodex = v; SetLoggedOut("codex", false); }, FetchCodex) : null }
                 .Where(i => i != null)
-                .Concat(extras.Where(x => x.SignedIn).Select(x => ServiceToggle(x.Name, ExtraOn(x.Key), v =>
+                .Concat(extras.Where(x => x.SignedIn).Select(x => ServiceToggle(x.Key.StartsWith("acc-", StringComparison.Ordinal) ? x.Name : MainTitle(x.Key, x.Name), ExtraOn(x.Key), v =>
                 {
                     var list = settings.HiddenExtras.Split(',').Where(k => k.Length > 0 && k != x.Key).ToList();
                     if (!v) list.Add(x.Key);
@@ -3348,12 +4458,52 @@ namespace AiLimitWidget
             if (AgyOn) outs.Add(Item("Antigravity", false, () => Logout("agy")));
             if (CodexOn) outs.Add(Item("Codex", false, () => Logout("codex")));
             if (outs.Count > 0) menu.Items.Add(Sub("Выйти из аккаунта", outs.ToArray()));
+            var acc = new List<MenuItem> { Item("Добавить аккаунт…", false, ChooseAccount) };
+            var mains = new List<string[]> { new[] { "claude", "Claude Code" }, new[] { "agy", "Antigravity" }, new[] { "codex", "Codex" } };
+            mains.AddRange(extras.Where(e => !e.Key.StartsWith("acc-", StringComparison.Ordinal)).Select(e => new[] { e.Key, e.Name }));
+            foreach (var m in mains.Where(m => HasAccounts(m[0])))
+            {
+                string mk = "main-" + m[0];
+                acc.Add(Sub(MainTitle(m[0], m[1]) + " (основной)", Item("Переименовать…", false, () => StartRenameAccount(mk))));
+            }
+            foreach (var x in extras.Where(x => x.Key.StartsWith("acc-", StringComparison.Ordinal)))
+            {
+                string k = x.Key;
+                string cmd = Extra.TerminalCommand(k);
+                var subItems = new List<MenuItem> { Item("Переименовать…", false, () => StartRenameAccount(k)) };
+                if (cmd != null) subItems.Add(Item("Команда для терминала", false, () => CopyTerminalCommand(cmd)));
+                subItems.Add(Item("Убрать", false, () => RemoveExtraAccount(k)));
+                acc.Add(Sub(x.Name, subItems.ToArray()));
+            }
+            menu.Items.Add(Sub("Аккаунты", acc.ToArray()));
             menu.Items.Add(Item("Закрыть", false, Exit));
         }
 
         // ---------- вход и выход ----------
         // Сам виджет войти не просит — берёт вход, который уже есть у Claude Code, Codex, Antigravity и других ИИ.
         // Выходим их же командами: «claude auth logout» удаляет ключи входа.
+        // есть ли ИИ на компьютере — в «Добавить аккаунт» показываем только установленные
+        static bool Installed(string svc)
+        {
+            if (svc == "claude") return OnPath(ClaudeExe);
+            if (svc == "codex") return OnPath(CodexExe);
+            if (svc == "geminicli") return OnPath("gemini");
+            return true;   // Antigravity — только когда в нём есть вход; свои ИИ — по их описанию
+        }
+
+        static bool OnPath(string exe)
+        {
+            try
+            {
+                if (Path.IsPathRooted(exe)) return File.Exists(exe);
+                foreach (string dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
+                    foreach (string ext in new[] { ".exe", ".cmd", ".bat", "" })
+                        if (dir.Trim().Length > 0 && File.Exists(Path.Combine(dir.Trim(), exe + ext))) return true;
+            }
+            catch (Exception) { }
+            return false;
+        }
+
         static string ClaudeExe
         {
             get
@@ -3437,7 +4587,6 @@ namespace AiLimitWidget
             else if (target == "agy")
             {
                 agyGroups.Clear();
-                agyExtra.Clear();
                 agyEmail = null;
                 agyCredits = null;
                 agyUpdatedAt = null;
@@ -3549,6 +4698,331 @@ namespace AiLimitWidget
             button.MouseLeftButtonDown += (s, e) => e.Handled = true;
             button.MouseLeftButtonUp += (s, e) => { e.Handled = true; click(); };
             return button;
+        }
+
+        // ---------- дополнительные аккаунты ----------
+        bool choosingAccount, waitingPolling;
+        string waitingSvc, waitingDir, renamingAccount;
+        int waitingNum;
+        DateTime waitingUntil = DateTime.MinValue, waitingNextPoll = DateTime.MinValue;
+        DateTime accountNoticeUntil = DateTime.MinValue;
+        UIElement renamePanel;
+        TextBox renameBox;
+
+        void ShowAccountNotice(string svc, string text, bool error)
+        {
+            accountNotice = text;
+            accountNoticeError = error;
+            accountNoticeUntil = DateTime.Now.AddMinutes(error ? 1 : 5);
+        }
+
+        void ChooseAccount()
+        {
+            confirmLogout = false;
+            renamingAccount = null;
+            renamePanel = null;
+            renameBox = null;
+            choosingAccount = true;
+            providersScan = DateTime.MinValue;
+            SyncProviders();
+            if (!window.IsVisible) ShowWidget();
+            UpdateView();
+        }
+
+        UIElement AccountPanel()
+        {
+            var panel = new StackPanel { Margin = new Thickness(0, 14, 0, 4) };
+            panel.Children.Add(new TextBlock { Text = "Добавить аккаунт", FontSize = 14, FontWeight = FontWeights.SemiBold,
+                                               Foreground = B("#F5F5F7"), TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 0, 0, 10) });
+            foreach (var ai in Extra.AccountAis(AgyAvail).Where(a => Installed(a[0])))
+            {
+                string svc = ai[0], title = ai[1], hex = ai[2];
+                var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
+                row.Children.Add(new System.Windows.Shapes.Ellipse { Width = 8, Height = 8, Fill = B(hex), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 1, 7, 0) });
+                row.Children.Add(new TextBlock { Text = title, FontSize = 13, FontWeight = FontWeights.SemiBold, Foreground = Brushes.White });
+                var btn = new Border { CornerRadius = new CornerRadius(6), Background = B("#3A3A3C"), Padding = new Thickness(12, 7, 12, 8),
+                                       Margin = new Thickness(0, 0, 0, 6), Cursor = System.Windows.Input.Cursors.Hand, Child = row };
+                btn.MouseEnter += (s, e) => btn.Opacity = 0.88;
+                btn.MouseLeave += (s, e) => btn.Opacity = 1;
+                btn.MouseLeftButtonDown += (s, e) => e.Handled = true;
+                btn.MouseLeftButtonUp += (s, e) => { e.Handled = true; StartAddAccount(svc); };
+                panel.Children.Add(btn);
+            }
+            var cancel = PanelButton("Отмена", B("#2C2C2E"), () => { choosingAccount = false; UpdateView(); });
+            cancel.Margin = new Thickness(0, 4, 0, 0);
+            panel.Children.Add(cancel);
+            return panel;
+        }
+
+        void StartAddAccount(string svc)
+        {
+            choosingAccount = false;
+            if (svc == "agy")
+            {
+                AddAgyAccount();
+                return;
+            }
+            AddFolderAccount(svc);
+        }
+
+        void AddFolderAccount(string svc)
+        {
+            if (waitingSvc != null) CancelAddAccount();
+            AccountSpec spec = Extra.AccountSpecFor(svc);
+            if (spec == null) return;
+            string folder = null;
+            try
+            {
+                string baseDir = Path.Combine(Extra.AccountsDir, svc);
+                Directory.CreateDirectory(baseDir);
+                int n = 1;
+                while (Directory.Exists(Path.Combine(baseDir, n.ToString(Inv)))) n++;
+                folder = Path.Combine(baseDir, n.ToString(Inv));
+                Directory.CreateDirectory(folder);
+                Extra.WaitingDir = folder;
+
+                string login = (spec.Login ?? "").Replace("{account}", "\"" + folder + "\"");
+                if (svc == "claude" && login.StartsWith("claude ", StringComparison.Ordinal))
+                    login = "\"" + ClaudeExe + "\"" + login.Substring(6);
+                else if (svc == "codex" && login.StartsWith("codex ", StringComparison.Ordinal))
+                    login = "\"" + CodexExe + "\"" + login.Substring(5);
+                string cmdArgs = !string.IsNullOrEmpty(spec.Env) && !string.IsNullOrEmpty(login)
+                    ? "/k \"set \"" + spec.Env + "=" + folder + "\" && " + login + "\""
+                    : !string.IsNullOrEmpty(spec.Env)
+                        ? "/k \"set \"" + spec.Env + "=" + folder + "\"\""
+                        : "/k \"" + login + "\"";
+                var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", cmdArgs)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = false,
+                    WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                };
+                if (!string.IsNullOrEmpty(spec.Env)) psi.EnvironmentVariables[spec.Env] = folder;
+                System.Diagnostics.Process.Start(psi);
+
+                waitingSvc = svc;
+                waitingDir = folder;
+                waitingNum = n;
+                waitingPolling = false;
+                waitingUntil = DateTime.Now.AddMinutes(30);
+                waitingNextPoll = DateTime.Now.AddSeconds(5);
+            }
+            catch (Exception)
+            {
+                Extra.WaitingDir = null;
+                waitingSvc = null;
+                waitingDir = null;
+                waitingNum = 0;
+                if (!string.IsNullOrEmpty(folder)) { try { if (Directory.Exists(folder)) Directory.Delete(folder, true); } catch (Exception) { } }
+                ShowAccountNotice(svc, "Не удалось открыть окно входа", true);
+            }
+            UpdateView();
+        }
+
+        UIElement WaitingAccountLine()
+        {
+            var g = new Grid { Margin = new Thickness(0, 2, 0, 6) };
+            g.ColumnDefinitions.Add(new ColumnDefinition());
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var txt = new TextBlock {
+                Text = "Ждём вход в " + Extra.AiName(waitingSvc) + "… окно входа открыто",
+                FontSize = 11.5, Foreground = B("#AEAEB2"), TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0)
+            };
+            var cancel = new Border {
+                CornerRadius = new CornerRadius(5), Background = B("#3A3A3C"), Padding = new Thickness(8, 3, 8, 4),
+                Cursor = System.Windows.Input.Cursors.Hand, VerticalAlignment = VerticalAlignment.Center,
+                Child = new TextBlock { Text = "Отменить", FontSize = 11.5, FontWeight = FontWeights.SemiBold, Foreground = B("#F5F5F7") }
+            };
+            cancel.MouseEnter += (s, e) => cancel.Opacity = 0.85;
+            cancel.MouseLeave += (s, e) => cancel.Opacity = 1;
+            cancel.MouseLeftButtonDown += (s, e) => e.Handled = true;
+            cancel.MouseLeftButtonUp += (s, e) => { e.Handled = true; CancelAddAccount(); };
+            Grid.SetColumn(cancel, 1);
+            g.Children.Add(txt);
+            g.Children.Add(cancel);
+            return g;
+        }
+
+        void CancelAddAccount()
+        {
+            string dir = waitingDir;
+            waitingSvc = null;
+            waitingDir = null;
+            waitingNum = 0;
+            waitingPolling = false;
+            Extra.WaitingDir = null;
+            if (!string.IsNullOrEmpty(dir))
+                ThreadPool.QueueUserWorkItem(_ => { try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch (Exception) { } });
+            UpdateView();
+        }
+
+        void PollWaitingAccount()
+        {
+            if (waitingSvc == null || waitingPolling) return;
+            string svc = waitingSvc, dir = waitingDir;
+            int num = waitingNum;
+            waitingPolling = true;
+            waitingNextPoll = DateTime.Now.AddSeconds(5);
+            Extra.MainAgyEmail = agyEmail;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string email;
+                bool duplicate;
+                bool ready = Extra.CheckWaitingFolder(svc, dir, num, out email, out duplicate);
+                dispatcher.BeginInvoke(new Action(() =>
+                {
+                    waitingPolling = false;
+                    if (waitingSvc != svc || waitingDir != dir) return;
+                    if (!ready)
+                    {
+                        waitingNextPoll = DateTime.Now.AddSeconds(5);
+                        return;
+                    }
+                    string ai = Extra.AiName(svc);
+                    waitingSvc = null;
+                    waitingDir = null;
+                    waitingNum = 0;
+                    Extra.WaitingDir = null;
+                    if (duplicate)
+                    {
+                        ThreadPool.QueueUserWorkItem(__ => { try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch (Exception) { } });
+                        if (tray != null) tray.ShowBalloonTip(4000, ai, "Этот аккаунт уже есть", WinForms.ToolTipIcon.Warning);
+                        ShowAccountNotice(svc, "Этот аккаунт уже есть", true);
+                        UpdateView();
+                        return;
+                    }
+                    string label = !string.IsNullOrEmpty(email) ? email : "аккаунт " + num.ToString(Inv);
+                    if (tray != null) tray.ShowBalloonTip(4000, "Лимиты ИИ", "Добавлен " + ai + " · " + label, WinForms.ToolTipIcon.Info);
+                    providersScan = DateTime.MinValue;
+                    SyncProviders();
+                    string key = "acc-" + svc + "-" + num.ToString(Inv);
+                    var ep = ExtraFor(key);
+                    if (ep != null)
+                    {
+                        ep.SignedIn = true;
+                        if (!string.IsNullOrEmpty(email)) ep.Email = email;
+                        ep.Name = Extra.AccountTitle(key, label);
+                        ep.NextFetch = DateTime.MinValue;
+                        FetchExtra(ep);
+                    }
+                    UpdateView();
+                }));
+            });
+        }
+
+        void StartRenameAccount(string key)
+        {
+            confirmLogout = false;
+            choosingAccount = false;
+            renamingAccount = key;
+            renamePanel = BuildRenamePanel(key);
+            if (!window.IsVisible) ShowWidget();
+            UpdateView();
+            dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (renameBox != null)
+                {
+                    window.Activate();
+                    renameBox.Focus();
+                    renameBox.SelectAll();
+                }
+            }), DispatcherPriority.Input);
+        }
+
+        UIElement BuildRenamePanel(string key)
+        {
+            var panel = new StackPanel { Margin = new Thickness(0, 14, 0, 4) };
+            bool main = key.StartsWith("main-", StringComparison.Ordinal);
+            string ai = main ? Extra.AiName(key.Substring(5)) : Extra.AccountPrefix(key) ?? "Аккаунт";
+            string def = (main ? MainEmail(key.Substring(5)) : Extra.GetDefaultLabel(key)) ?? "";
+            panel.Children.Add(new TextBlock { Text = "Переименовать · " + ai, FontSize = 14, FontWeight = FontWeights.SemiBold,
+                                               Foreground = B("#F5F5F7"), TextAlignment = TextAlignment.Center });
+            if (!string.IsNullOrEmpty(def))
+                panel.Children.Add(new TextBlock { Text = def, FontSize = 11.5, Foreground = B("#8E8E93"),
+                                                   TextAlignment = TextAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, Margin = new Thickness(0, 3, 0, 0) });
+            var box = new TextBox {
+                Text = Extra.GetCustomName(key) ?? def,
+                FontSize = 13, Foreground = B("#F5F5F7"), Background = B("#2C2C2E"), CaretBrush = Brushes.White,
+                BorderBrush = B("#48484A"), BorderThickness = new Thickness(1), Padding = new Thickness(8, 5, 8, 6),
+                Margin = new Thickness(0, 10, 0, 12)
+            };
+            box.KeyDown += (s, e) =>
+            {
+                if (e.Key == System.Windows.Input.Key.Enter) { e.Handled = true; SaveRenameAccount(); }
+                else if (e.Key == System.Windows.Input.Key.Escape) { e.Handled = true; CancelRenameAccount(); }
+            };
+            renameBox = box;
+            panel.Children.Add(box);
+            var buttons = new Grid();
+            buttons.ColumnDefinitions.Add(new ColumnDefinition());
+            buttons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(8) });
+            buttons.ColumnDefinitions.Add(new ColumnDefinition());
+            var cancel = PanelButton("Отмена", B("#3A3A3C"), CancelRenameAccount);
+            var save = PanelButton("Сохранить", B(Accent), SaveRenameAccount);
+            Grid.SetColumn(save, 2);
+            buttons.Children.Add(cancel);
+            buttons.Children.Add(save);
+            panel.Children.Add(buttons);
+            return panel;
+        }
+
+        void SaveRenameAccount()
+        {
+            string key = renamingAccount;
+            string val = renameBox == null ? "" : (renameBox.Text ?? "").Trim();
+            renamingAccount = null;
+            renamePanel = null;
+            renameBox = null;
+            if (!string.IsNullOrEmpty(key))
+            {
+                string def = key.StartsWith("main-", StringComparison.Ordinal) ? MainEmail(key.Substring(5)) : Extra.GetDefaultLabel(key);
+                if (string.IsNullOrEmpty(val) || string.Equals(val, def, StringComparison.Ordinal))
+                    settings.AccountNames.Remove(key);
+                else
+                    settings.AccountNames[key] = val;
+                Extra.SetCustomNames(settings.AccountNames);
+                SaveSettings();
+                var ep = ExtraFor(key);
+                if (ep != null) ep.Name = Extra.AccountTitle(key, ep.Email ?? def);
+                clockKeys = null;
+                lastTrayKey = null;
+            }
+            UpdateView();
+        }
+
+        void CancelRenameAccount()
+        {
+            renamingAccount = null;
+            renamePanel = null;
+            renameBox = null;
+            UpdateView();
+        }
+
+        static void CopyTerminalCommand(string cmd)
+        {
+            try { Clipboard.SetText(cmd); } catch (Exception) { }
+        }
+
+        void RemoveExtraAccount(string key)
+        {
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                bool ok = Extra.RemoveAccount(key);
+                dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (!ok) return;
+                    extras.RemoveAll(x => x.Key == key);
+                    settings.AccountNames.Remove(key);
+                    Extra.SetCustomNames(settings.AccountNames);
+                    settings.ClockItems = string.Join(",", settings.ClockItems.Split(',').Where(k => k.Length > 0 && k != key));
+                    settings.SeenExtras = string.Join(",", settings.SeenExtras.Split(',').Where(k => k.Length > 0 && k != key));
+                    settings.HiddenExtras = string.Join(",", settings.HiddenExtras.Split(',').Where(k => k.Length > 0 && k != key));
+                    SaveSettings();
+                    lastTrayKey = null;
+                    UpdateView();
+                }));
+            });
         }
 
         void ClearData()

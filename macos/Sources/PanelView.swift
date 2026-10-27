@@ -23,12 +23,18 @@ struct PanelView: View {
             if !w.preview { header.padding(.trailing, 12).background(HeightReader { headerHeight = $0 }) }
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 0) {
-                    if w.confirmLogout || w.loggingOut {
+                    if w.renamingAccount != nil {
+                        RenameAccountPanel(w: w)
+                    } else if w.confirmLogout || w.loggingOut {
                         LogoutPanel(w: w)
+                    } else if w.choosingAccount {
+                        ChooseAccountPanel(w: w)
                     } else {
                         sections(now)
                     }
-                    if !w.preview && !w.confirmLogout && !w.loggingOut { DetailsView(w: w, now: now) }
+                    if !w.preview && !w.confirmLogout && !w.loggingOut && !w.choosingAccount && w.renamingAccount == nil {
+                        DetailsView(w: w, now: now)
+                    }
                 }
                 .padding(.trailing, 12)   // полоса прокрутки — в этом отступе, поверх текста не ложится
                 .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -68,10 +74,28 @@ struct PanelView: View {
         }
     }
 
+    // ключ самого первого видимого раздела — у него нет разделительной черты сверху
+    var firstSectionKey: String? {
+        if w.claudeOn { return "claude" }
+        if let f = w.accountSections("claude").first { return f.key }
+        if w.agyOn { return "agy" }
+        if let f = w.accountSections("agy").first { return f.key }
+        if w.codexOn { return "codex" }
+        if let f = w.accountSections("codex").first { return f.key }
+        let mainExtras = w.shownExtras.filter { !$0.key.hasPrefix("acc-") }
+        if let f = mainExtras.first { return f.key }
+        let drawnSvcs = ["claude", "agy", "codex"] + mainExtras.map { $0.key }
+        let orphans = w.shownExtras.filter { p in
+            p.key.hasPrefix("acc-") && !drawnSvcs.contains { Widget.sameSvc(Extra.accountSvc(p.key), $0) }
+        }
+        return orphans.first?.key
+    }
+
     // по разделу на сервис
     @ViewBuilder func sections(_ now: Date) -> some View {
+        let firstKey = firstSectionKey
         if w.claudeOn {
-            ProviderHeader(name: "Claude Code", colors: [Pal.accent], note: w.plan, first: true)
+            ProviderHeader(name: w.mainTitle("claude", "Claude Code"), colors: [Pal.accent], note: w.plan, first: firstKey == "claude")
             if let sess = w.session {
                 let active = sess.resetsAt.map { $0 > now } ?? false
                 LimitRow(l: sess, now: now, note: active ? nil : "Не начата — 5-часовое окно начнётся с первого запроса", accent: Pal.accent)
@@ -81,35 +105,82 @@ struct PanelView: View {
             ForEach(w.weekly, id: \.key) { l in LimitRow(l: l, now: now, note: nil, accent: Pal.accent) }
             if !w.status.isEmpty { StatusLine(w.status, w.statusIsError) }
         }
+        ForEach(w.accountSections("claude"), id: \.key) { acc in
+            ExtraSection(w: w, p: acc, now: now, first: firstKey == acc.key)
+        }
         if w.agyOn {
             let credits = (w.agyCredits ?? 0) > 0 ? "кредиты: \(Int(w.agyCredits!.rounded()))" : nil
             let colors = w.agyGroups.isEmpty ? [Pal.gemini, Pal.agyClaude] : w.agyGroups.map { Pal.group($0.key) }.reduce(into: [NSColor]()) { a, c in if !a.contains(c) { a.append(c) } }
-            ProviderHeader(name: "Antigravity", colors: colors, note: credits, first: !w.claudeOn)
+            ProviderHeader(name: w.mainTitle("agy", "Antigravity"), colors: colors, note: credits, first: firstKey == "agy")
             if w.agyGroups.isEmpty && w.agyStatus.isEmpty { Hint("Загрузка…") }
             ForEach(w.agyGroups, id: \.key) { g in AgyRow(g: g, now: now) }
             if !w.agyStatus.isEmpty { StatusLine(w.agyStatus, w.agyStatusIsError) }
         }
+        ForEach(w.accountSections("agy"), id: \.key) { acc in
+            ExtraSection(w: w, p: acc, now: now, first: firstKey == acc.key)
+        }
         if w.codexOn {
-            ProviderHeader(name: "Codex", colors: [Pal.codex], note: w.codexPlan, first: !w.claudeOn && !w.agyOn)
+            ProviderHeader(name: w.mainTitle("codex", "Codex"), colors: [Pal.codex], note: w.codexPlan, first: firstKey == "codex")
             if w.codexLimits.isEmpty && w.codexStatus.isEmpty { Hint(w.codexUpdatedAt != nil ? "Сервер не сообщил лимиты" : "Загрузка…") }
             ForEach(w.codexLimits, id: \.key) { l in LimitRow(l: l, now: now, note: nil, accent: Pal.codex) }
             if !w.codexStatus.isEmpty { StatusLine(w.codexStatus, w.codexStatusIsError) }
         }
+        ForEach(w.accountSections("codex"), id: \.key) { acc in
+            ExtraSection(w: w, p: acc, now: now, first: firstKey == acc.key)
+        }
         // другие ИИ — только те, в которые вошли; у каждого свой цвет
-        let extras = w.shownExtras
-        ForEach(extras, id: \.key) { p in
-            ProviderHeader(name: p.name, colors: [p.color], note: p.plan,
-                           first: !w.claudeOn && !w.agyOn && !w.codexOn && p === extras.first)
-            if p.limits.isEmpty && p.status.isEmpty { Hint("Загрузка…") }
-            ForEach(p.limits, id: \.key) { l in LimitRow(l: l, now: now, note: nil, accent: p.color) }
-            if !p.status.isEmpty { StatusLine(p.status, p.statusIsError) }
+        let mainExtras = w.shownExtras.filter { !$0.key.hasPrefix("acc-") }
+        ForEach(mainExtras, id: \.key) { p in
+            ExtraSection(w: w, p: p, now: now, first: firstKey == p.key)
+            ForEach(w.accountSections(p.key), id: \.key) { acc in
+                ExtraSection(w: w, p: acc, now: now, first: firstKey == acc.key)
+            }
+        }
+        // аккаунты ИИ, чей основной раздел скрыт, — в конце
+        let drawnSvcs = ["claude", "agy", "codex"] + mainExtras.map { $0.key }
+        let orphanExtras = w.shownExtras.filter { p in
+            p.key.hasPrefix("acc-") && !drawnSvcs.contains { Widget.sameSvc(Extra.accountSvc(p.key), $0) }
+        }
+        ForEach(orphanExtras, id: \.key) { acc in
+            ExtraSection(w: w, p: acc, now: now, first: firstKey == acc.key)
+        }
+        if w.waitingSvc != nil {
+            WaitingAccountLine(w: w)
+        }
+        if !w.accountNotice.isEmpty && now < w.accountNoticeUntil {
+            StatusLine(w.accountNotice, w.accountNoticeError)
         }
         // ни в один ИИ не вошли — просто пояснение, без кнопок входа
-        if w.shownServices == 0 {
+        if w.shownServices == 0 && w.waitingSvc == nil {
             Hint(w.anyFetching || !w.agyChecked ? "Ищем ИИ, в которые вы вошли…"
                  : "На этом Mac нет входа ни в один ИИ.\nВойдите в Claude Code, Codex, Gemini CLI или Antigravity — лимиты появятся здесь сами.")
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+// раздел другого ИИ или дополнительного аккаунта; у аккаунта Antigravity — группы, как в основном разделе
+struct ExtraSection: View {
+    @ObservedObject var w: Widget
+    let p: ExtraProvider
+    let now: Date
+    let first: Bool
+
+    var body: some View {
+        let groups = p.groups ?? []
+        let hasGroups = !groups.isEmpty
+        let colors: [NSColor] = hasGroups
+            ? groups.map { Pal.lighter(Pal.group($0.key)) }.reduce(into: [NSColor]()) { a, c in if !a.contains(c) { a.append(c) } }
+            : [p.color]
+        let title = p.key.hasPrefix("acc-") ? p.name : w.mainTitle(p.key, p.name)
+        ProviderHeader(name: title, colors: colors, note: p.plan, first: first)
+        if p.limits.isEmpty && p.status.isEmpty { Hint("Загрузка…") }
+        if hasGroups {
+            ForEach(groups, id: \.key) { g in AgyRow(g: g, now: now, lighter: true) }
+        } else {
+            ForEach(p.limits, id: \.key) { l in LimitRow(l: l, now: now, note: nil, accent: p.color) }
+        }
+        if !p.status.isEmpty { StatusLine(p.status, p.statusIsError) }
     }
 }
 
@@ -201,8 +272,11 @@ struct ProviderHeader: View {
                 HStack(spacing: -2) { ForEach(colors.indices, id: \.self) { i in Dot(colors[i], 8) } }   // точки чуть внахлёст
                     .padding(.trailing, 7)
                 Text(name).font(.system(size: 13, weight: .semibold)).foregroundColor(Ink.primary)
+                    .lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 6)
-                if let note = note, !note.isEmpty { Text(note).font(.system(size: 11)).foregroundColor(Ink.tertiary) }
+                if let note = note, !note.isEmpty {
+                    Text(note).font(.system(size: 11)).foregroundColor(Ink.tertiary).lineLimit(1).padding(.leading, 2)
+                }
             }
         }
         .padding(.top, first ? 8 : 14)
@@ -240,12 +314,14 @@ struct LimitRow: View {
 }
 
 // группа Antigravity: название и две полосы рядом — 5 часов и неделя
+// lighter — группа второго аккаунта: тот же вид, цвет светлее
 struct AgyRow: View {
     let g: AgyGroup
     let now: Date
+    var lighter = false
 
     var body: some View {
-        let color = Pal.group(g.key)
+        let color = lighter ? Pal.lighter(Pal.group(g.key)) : Pal.group(g.key)
         // упёрлись в лимит — группа стоит до сброса именно этого окна
         let hit = [g.session, g.week].compactMap { $0 }.filter { current($0, now) >= 99.5 }
             .max { ($0.resetsAt ?? .distantFuture) < ($1.resetsAt ?? .distantFuture) }
@@ -328,6 +404,112 @@ struct PanelButton: View {
     }
 }
 
+struct WaitingAccountLine: View {
+    @ObservedObject var w: Widget
+    @State var hover = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("Ждём вход в \(Extra.aiName(w.waitingSvc ?? ""))… окно входа открыто")
+                .font(.system(size: 11.5)).foregroundColor(Ink.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button(action: { w.cancelAddAccount() }) {
+                Text("Отменить").font(.system(size: 11.5, weight: .semibold)).foregroundColor(Ink.primary)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(Color(hex: "#3A3A3C")))
+                    .opacity(hover ? 0.85 : 1)
+            }
+            .buttonStyle(.plain)
+            .onHover { hover = $0 }
+        }
+        .padding(.top, 8).padding(.bottom, 2)
+    }
+}
+
+struct AccountChoiceButton: View {
+    let title: String
+    let color: NSColor
+    let action: () -> Void
+    @State var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Dot(color, 8)
+                Text(title).font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+            }
+            .frame(maxWidth: .infinity).padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#3A3A3C")))
+            .opacity(hover ? 0.88 : 1)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+    }
+}
+
+struct ChooseAccountPanel: View {
+    @ObservedObject var w: Widget
+
+    var body: some View {
+        let ais = Extra.accountAis(w.agyAvail).filter { Widget.installed($0.key) }
+        VStack(spacing: 0) {
+            Text("Добавить аккаунт").font(.system(size: 14, weight: .semibold)).foregroundColor(Ink.primary)
+                .padding(.bottom, 10)
+            ForEach(ais, id: \.key) { ai in
+                AccountChoiceButton(title: ai.name, color: NSColor(hex: ai.color)) {
+                    w.startAddAccount(ai.key)
+                }
+                .padding(.bottom, 6)
+            }
+            PanelButton(text: "Отмена", color: Color(hex: "#2C2C2E")) {
+                w.choosingAccount = false
+                w.updateView()
+            }
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 14).padding(.bottom, 4)
+    }
+}
+
+struct RenameAccountPanel: View {
+    @ObservedObject var w: Widget
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        let key = w.renamingAccount ?? ""
+        let main = key.hasPrefix("main-")
+        let ai = main ? Extra.aiName(String(key.dropFirst(5))) : (Extra.accountPrefix(key) ?? "Аккаунт")
+        let def = (main ? w.mainEmail(String(key.dropFirst(5))) : Extra.getDefaultLabel(key)) ?? ""
+        VStack(spacing: 0) {
+            Text("Переименовать · \(ai)").font(.system(size: 14, weight: .semibold)).foregroundColor(Ink.primary)
+            if !def.isEmpty {
+                Text(def).font(.system(size: 11.5)).foregroundColor(Ink.tertiary)
+                    .lineLimit(1).truncationMode(.tail).padding(.top, 3)
+            }
+            TextField("", text: $w.renameText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .foregroundColor(Ink.primary)
+                .padding(.horizontal, 8).padding(.vertical, 6)
+                .background(RoundedRectangle(cornerRadius: 5).fill(Color(hex: "#2C2C2E")))
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color(hex: "#48484A"), lineWidth: 1))
+                .focused($focused)
+                .onSubmit { w.saveRenameAccount() }
+                .padding(.top, 10).padding(.bottom, 12)
+            HStack(spacing: 8) {
+                PanelButton(text: "Отмена", color: Color(hex: "#3A3A3C")) { w.cancelRenameAccount() }
+                PanelButton(text: "Сохранить", color: Color(nsColor: Pal.accent)) { w.saveRenameAccount() }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 14).padding(.bottom, 4)
+        .onAppear { DispatchQueue.main.async { focused = true } }
+    }
+}
+
 struct LogoutPanel: View {
     @ObservedObject var w: Widget
 
@@ -404,10 +586,10 @@ struct DetailsView: View {
 
     func accountRows(_ claudeOn: Bool, _ agyOn: Bool, _ codexOn: Bool) -> [AccountRow] {
         var list: [AccountRow] = []
-        if claudeOn { list.append(AccountRow(color: Pal.accent, service: "Claude Code", email: J.string(w.account?["emailAddress"]), plan: w.plan.isEmpty ? nil : "Claude " + w.plan)) }
-        if agyOn { list.append(AccountRow(color: Pal.gemini, service: "Antigravity", email: w.agyEmail, plan: nil)) }
-        if codexOn { list.append(AccountRow(color: Pal.codex, service: "Codex", email: w.codexEmail, plan: w.codexPlan.isEmpty ? nil : "ChatGPT " + w.codexPlan)) }
-        for p in w.shownExtras { list.append(AccountRow(color: p.color, service: p.name, email: p.email, plan: p.plan.isEmpty ? nil : p.plan)) }
+        if claudeOn { list.append(AccountRow(color: Pal.accent, service: w.accountName("claude", "Claude Code"), email: J.string(w.account?["emailAddress"]), plan: w.plan.isEmpty ? nil : "Claude " + w.plan)) }
+        if agyOn { list.append(AccountRow(color: Pal.gemini, service: w.accountName("agy", "Antigravity"), email: w.agyEmail, plan: nil)) }
+        if codexOn { list.append(AccountRow(color: Pal.codex, service: w.accountName("codex", "Codex"), email: w.codexEmail, plan: w.codexPlan.isEmpty ? nil : "ChatGPT " + w.codexPlan)) }
+        for p in w.shownExtras { list.append(AccountRow(color: p.color, service: w.accountName(p.key, p.name), email: p.email, plan: Widget.accountPlan(p))) }
         return list
     }
 
@@ -419,10 +601,10 @@ struct DetailsView: View {
 
     func weekRows(_ claudeOn: Bool, _ agyOn: Bool, _ codexOn: Bool) -> [(NSColor, String, Double)] {
         var list: [(NSColor, String, Double)] = []
-        if claudeOn { for b in w.breakdown where b.1 >= 0.5 { list.append((Pal.accent, "Claude · " + b.0, b.1)) } }
+        if claudeOn { for b in w.breakdown where b.1 >= 0.5 { list.append((Pal.accent, w.accountName("claude", "Claude") + " · " + b.0, b.1)) } }
         if agyOn { for g in w.agyGroups where g.week != nil { list.append((Pal.group(g.key), g.title + " · лимит", current(g.week, now))) } }
-        if codexOn, let l = w.codexLong { list.append((Pal.codex, "Codex · " + l.title.lowercased(), current(l, now))) }
-        for p in w.shownExtras { if let l = p.long ?? p.short { list.append((p.color, p.name + " · " + l.title.lowercased(), current(l, now))) } }
+        if codexOn, let l = w.codexLong { list.append((Pal.codex, w.accountName("codex", "Codex") + " · " + l.title.lowercased(), current(l, now))) }
+        for p in w.shownExtras { if let l = p.long ?? p.short { list.append((p.color, w.accountName(p.key, p.name) + " · " + l.title.lowercased(), current(l, now))) } }
         return list
     }
 
@@ -463,9 +645,12 @@ func Pair(_ label: String, _ value: String) -> some View {
 
 // строка подробностей с цветной точкой сервиса перед названием
 func PairDot(_ color: NSColor, _ label: String, _ value: String) -> some View {
-    HStack(spacing: 0) {
+    let shortRight = value.count <= 6
+    return HStack(spacing: 0) {
         Dot(color, 6).padding(.trailing, 6)
         Text(label).font(.system(size: 12)).foregroundColor(Ink.secondary)
+            .lineLimit(1).truncationMode(.tail)
+            .frame(maxWidth: shortRight ? .infinity : 150, alignment: .leading)
         Spacer(minLength: 12)
         Text(value).font(.system(size: 12, weight: .semibold)).foregroundColor(Ink.primary).lineLimit(1).truncationMode(.tail).help(value)
     }

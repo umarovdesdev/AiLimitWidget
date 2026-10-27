@@ -9,11 +9,11 @@ import AppKit
 import SwiftUI
 
 final class Limit {
-    let key: String
+    var key: String
     var title: String
     let percent: Double          // израсходовано, 0…100 (у Antigravity пересчитано из остатка)
     let resetsAt: Date?
-    let windowSeconds: Int64     // длина окна лимита (у Codex приходит с сервера)
+    var windowSeconds: Int64     // длина окна лимита (у Codex приходит с сервера)
 
     init(key: String, title: String, percent: Double, resetsAt: Date?, windowSeconds: Int64 = 0) {
         self.key = key; self.title = title; self.percent = percent; self.resetsAt = resetsAt; self.windowSeconds = windowSeconds
@@ -42,12 +42,21 @@ struct AppSettings {
     var seenExtras = ""          // ИИ из папки providers, которые уже встречались: новый сам получает столбец в строке меню
     var hiddenExtras = ""        // другие ИИ (Gemini CLI, Copilot, Cursor), которые выключили в «Показывать»
     var loggedOut = ""           // сервисы, скрытые из-за выхода: вернутся сами, когда в них снова войдут
+    var accountNames: [String: String] = [:]   // свои имена аккаунтов («acc-…» или «main-…» → имя)
 }
 
 // у каждого лимита свой цвет: Claude Code — оранжевый, Gemini — зелёный, Claude и GPT в Antigravity — синий, Codex — жёлтый
 enum Pal {
     static let accent = NSColor(hex: "#D97757"), gemini = NSColor(hex: "#34C759"), agyClaude = NSColor(hex: "#4C8DF6"),
                codex = NSColor(hex: "#FFD60A"), warn = NSColor(hex: "#FF9F0A"), danger = NSColor(hex: "#FF453A")
+
+    static func lighter(_ c: NSColor) -> NSColor {
+        let srgb = c.usingColorSpace(.sRGB) ?? c
+        return NSColor(srgbRed: srgb.redComponent + (1 - srgb.redComponent) * 0.45,
+                       green: srgb.greenComponent + (1 - srgb.greenComponent) * 0.45,
+                       blue: srgb.blueComponent + (1 - srgb.blueComponent) * 0.45,
+                       alpha: srgb.alphaComponent)
+    }
 
     static func group(_ key: String) -> NSColor {
         switch key {
@@ -135,20 +144,119 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         enableColumns(fresh)
     }
 
-    // новые файлы в папке providers: ИИ появляется в панели и в меню, а в строке меню — один раз включается его столбец
+    // новые файлы в папке providers и папки аккаунтов: раздел появляется в панели и в меню, а в строке меню — включается его столбец
     private var providersScan = Date.distantPast
+    var addingFolderUntil = Date.distantPast
+    var accountNotice = ""
+    var accountNoticeError = false
+    var accountNoticeUntil = Date.distantPast
+
+    func extraFor(_ key: String) -> ExtraProvider? { extras.first { $0.key == key } }
+
+    static func sameSvc(_ s: String?, _ svc: String) -> Bool {
+        guard let s = s else { return false }
+        return s == svc || "p-" + s == svc || s == "p-" + svc
+    }
+
+    // есть ли у ИИ svc дополнительные аккаунты
+    func hasAccounts(_ svc: String) -> Bool {
+        extras.contains { $0.key.hasPrefix("acc-") && Widget.sameSvc(Extra.accountSvc($0.key), svc) }
+    }
+
+    // почта основного аккаунта ИИ
+    func mainEmail(_ svc: String) -> String? {
+        if svc == "claude" { return J.string(account?["emailAddress"]) }
+        if svc == "agy" { return agyEmail }
+        if svc == "codex" { return codexEmail }
+        return extraFor(svc)?.email
+    }
+
+    // заголовок основного раздела: пока аккаунт один — просто имя ИИ, когда их несколько — «ИИ · почта» (или своё название),
+    // как у дополнительных аккаунтов
+    func mainTitle(_ svc: String, _ ai: String) -> String {
+        if !hasAccounts(svc) { return ai }
+        let custom = s.accountNames["main-" + svc]
+        let label = (custom?.isEmpty == false) ? custom : mainEmail(svc)
+        return (label?.isEmpty == false) ? ai + " · " + label! : ai
+    }
+
+    // название аккаунта слева в списках: имя ИИ и (если переименован) своё имя аккаунта, без почты
+    func accountName(_ key: String, _ ai: String) -> String {
+        let acc = key.hasPrefix("acc-")
+        let prefix = acc ? (Extra.accountPrefix(key) ?? ai) : ai
+        let custom = Extra.getCustomName(acc ? key : "main-" + key)
+        return (custom?.isEmpty == false) ? prefix + " · " + custom! : prefix
+    }
+
+    // тариф дополнительного аккаунта или другого ИИ в блоке «Аккаунты» — так же, как у основных
+    static func accountPlan(_ p: ExtraProvider) -> String? {
+        if p.plan.isEmpty { return nil }
+        let svc = Extra.accountSvc(p.key)
+        if svc == "claude" { return "Claude " + p.plan }
+        if svc == "codex" { return "ChatGPT " + p.plan }
+        if svc == "agy" { return nil }
+        return p.plan
+    }
+
+    // короткое имя для подсказки: своё имя или «Antigravity 2», без почты
+    func trayExtraName(_ p: ExtraProvider) -> String {
+        if !p.key.hasPrefix("acc-") { return p.name }
+        if let custom = Extra.getCustomName(p.key), !custom.isEmpty { return custom }
+        let svc = Extra.accountSvc(p.key) ?? ""
+        let prefix = Extra.accountPrefix(p.key) ?? p.name
+        let list = extras.filter { $0.key.hasPrefix("acc-") && Widget.sameSvc(Extra.accountSvc($0.key), svc) }
+        let idx = list.firstIndex { $0.key == p.key } ?? 0
+        return "\(prefix) \(idx + 2)"
+    }
+
+    func accountSections(_ svc: String) -> [ExtraProvider] {
+        shownExtras.filter { $0.key.hasPrefix("acc-") && Widget.sameSvc(Extra.accountSvc($0.key), svc) }
+    }
 
     func syncProviders() {
-        if Date() < providersScan { return }   // папку смотрим не чаще раза в 10 с
-        providersScan = Date().addingTimeInterval(10)
+        if Date() < providersScan { return }   // папку смотрим не чаще раза в 10 с (при входе в новый аккаунт — раз в 2 с)
+        providersScan = Date().addingTimeInterval(Date() < addingFolderUntil ? 2 : 10)
+        Extra.mainAgyEmail = agyEmail
         let found = Extra.scanProviders()
+        if let dupSvc = Extra.lastDuplicateSvc {
+            Extra.lastDuplicateSvc = nil
+            showAccountNotice(dupSvc, "Этот аккаунт уже есть", error: true)
+            Notify.post("Этот аккаунт уже есть", Extra.aiName(dupSvc))
+        }
+        for x in extras {
+            if let a = Extra.all.first(where: { $0.key == x.key }) { x.name = a.name }
+        }
+        let removed = extras.filter { x in !Extra.all.contains { $0.key == x.key } }.map { $0.key }
+        if !removed.isEmpty {
+            extras.removeAll { removed.contains($0.key) }
+            s.clockItems = s.clockItems.split(separator: ",").map(String.init).filter { !$0.isEmpty && !removed.contains($0) }.joined(separator: ",")
+            s.seenExtras = s.seenExtras.split(separator: ",").map(String.init).filter { !$0.isEmpty && !removed.contains($0) }.joined(separator: ",")
+            s.hiddenExtras = s.hiddenExtras.split(separator: ",").map(String.init).filter { !$0.isEmpty && !removed.contains($0) }.joined(separator: ",")
+            lastIconKey = nil
+            saveSettings()
+            updateView()
+        }
         if found.isEmpty { return }
-        extras += found.map { ExtraProvider(key: $0.key, name: $0.name, color: NSColor(hex: $0.color)) }
+        for e in found {
+            let isAcc = e.key.hasPrefix("acc-")
+            let def = isAcc ? Extra.getDefaultLabel(e.key) : nil
+            let ep = ExtraProvider(key: e.key, name: e.name, color: NSColor(hex: e.color))
+            ep.signedIn = isAcc
+            if let def = def, def.contains("@") { ep.email = def }
+            extras.append(ep)
+            if isAcc { addingFolderUntil = .distantPast }
+        }
         let seen = s.seenExtras.split(separator: ",").map(String.init).filter { !$0.isEmpty }
         let fresh = found.map { $0.key }.filter { !seen.contains($0) }
-        if fresh.isEmpty { return }
-        s.seenExtras = (seen + fresh).joined(separator: ",")
-        enableColumns(fresh)
+        if !fresh.isEmpty {
+            s.seenExtras = (seen + fresh).joined(separator: ",")
+            enableColumns(fresh)
+        }
+        for e in found where e.key.hasPrefix("acc-") {
+            if let ep = extraFor(e.key) { fetchExtra(ep) }
+        }
+        lastIconKey = nil
+        updateView()
     }
 
     let dir: String
@@ -239,6 +347,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         loadCache()
         loadAgyCache()
         loadCodexCache()
+        syncProviders()
         Notify.setup()
         DispatchQueue.global().async { _ = Shell.loginPath }   // PATH пользователя — заранее, в фоне
 
@@ -279,10 +388,12 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             }
             return nil
         }
-        // Esc — закрыть панель
+        // Esc — отменить переименование/выбор аккаунта или закрыть панель
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self = self, e.keyCode == 53, self.popover.isShown, e.window === self.popover.contentViewController?.view.window else { return e }
-            self.hideWidget()
+            if self.renamingAccount != nil { self.cancelRenameAccount() }
+            else if self.choosingAccount { self.choosingAccount = false; self.updateView() }
+            else { self.hideWidget() }
             return nil
         }
         // нажали в панели, открытой наведением, — она остаётся открытой как обычно
@@ -317,7 +428,17 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             if let v = J.string(d["LoggedOut"]) { s.loggedOut = v }
             if let v = J.string(d["HiddenExtras"]) { s.hiddenExtras = v }
             if let v = J.string(d["AgyKeys"]) { s.agyKeys = v }
+            // столбцы «gemini@2» от старых версий больше не существуют
+            s.clockItems = s.clockItems.split(separator: ",").map(String.init).filter { !$0.isEmpty && !$0.contains("@") }.joined(separator: ",")
+            s.agyKeys = s.agyKeys.split(separator: ",").map(String.init).filter { !$0.isEmpty && !$0.contains("@") }.joined(separator: ",")
             if let v = J.string(d["SeenExtras"]) { s.seenExtras = v }
+            if let names = d["AccountNames"] as? JSON {
+                s.accountNames.removeAll()
+                for (k, v) in names {
+                    if let val = J.string(v), !k.isEmpty, !val.isEmpty { s.accountNames[k] = val }
+                }
+            }
+            Extra.setCustomNames(s.accountNames)
             // настройки старой версии: столбцы других ИИ в строке меню включены по умолчанию
             if J.bool(d["ClockExtras"]) == nil { s.clockItems += "," + Extra.all.map { $0.key }.joined(separator: ",") }
         }
@@ -330,7 +451,8 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         J.write(["Transparency": s.transparency, "RefreshMinutes": s.refreshMinutes, "Notify": s.notify,
                  "ClockLabel": s.clockLabel, "ShowClaude": s.showClaude, "ShowAgy": s.showAgy, "ShowCodex": s.showCodex,
                  "ShowDetails": s.showDetails, "ClockItems": s.clockItems, "LoggedOut": s.loggedOut,
-                 "HiddenExtras": s.hiddenExtras, "AgyKeys": s.agyKeys, "SeenExtras": s.seenExtras, "ClockExtras": true] as [String: Any], settingsPath)
+                 "HiddenExtras": s.hiddenExtras, "AgyKeys": s.agyKeys, "SeenExtras": s.seenExtras,
+                 "AccountNames": s.accountNames, "ClockExtras": true] as [String: Any], settingsPath)
     }
 
     // ---------- данные Claude ----------
@@ -402,6 +524,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         fetch()
         fetchAgy()
         fetchCodex()
+        providersScan = .distantPast
         syncProviders()
         for p in extras { fetchExtra(p) }
         checkReturn(true)   // заодно — не вошли ли снова в скрытые после выхода сервисы
@@ -510,6 +633,16 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         Shell.find("agy", extra: [Shell.home + "/.agy/bin/agy", Shell.home + "/Library/Application Support/agy/bin/agy"])
     }
     static var agyDir: String { Shell.home + "/.gemini/antigravity-cli" }
+    static let busyText = "Antigravity занят задачей ace — обновлю, как освободится"
+    static let addingText = "В открывшемся окне Antigravity выполните /login и войдите другим аккаунтом, потом закройте окно"
+
+    // выполняет «agy -p <команда> --output-format json»
+    static func runAgy(_ command: String) -> (output: String?, missing: Bool) {
+        guard let exe = agyExe else { return (nil, true) }
+        var env = Shell.environment
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
+        return Proc.run(exe, ["-p", command, "--output-format", "json"], env: env)
+    }
 
     // probe — пробный запрос для скрытого после выхода Antigravity: ответил — значит, снова вошли
     func fetchAgy(probe: Bool = false) {
@@ -523,24 +656,76 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
                 DispatchQueue.main.async { self.agyOffline() }
                 return
             }
-            var quota: String?, credits: String?
-            var missing = true
-            if let exe = Widget.agyExe {
-                // при опросе автообновление agy выключаем — обновляем его сами, отдельно (updateAgy)
-                var env = Shell.environment
-                env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
-                let q = Proc.run(exe, ["-p", "/quota", "--output-format", "json"], env: env)
-                quota = q.output
-                missing = q.missing
-                if quota != nil { credits = Proc.run(exe, ["-p", "/credits", "--output-format", "json"], env: env).output }
+            let accounts = AgyAccounts.prepare()
+            if let added = AgyAccounts.takeJustAdded() {
+                DispatchQueue.main.async { Notify.post("Лимиты ИИ", "Добавлен Antigravity · " + added) }
+            }
+            guard let accounts = accounts else {
+                DispatchQueue.main.async { self.agyBusy() }
+                return
+            }
+            if AgyAccounts.isAdding {
+                DispatchQueue.main.async { self.agyWaitAdding() }
+                return
+            }
+            var quota: String?, credits: String?, accEmail: String?
+            var missing = false
+            if accounts.count > 1 {
+                // несколько аккаунтов: основной опрашиваем внутри блокировки AgyAccounts, чтобы не прочитать чужой вход
+                let r = AgyAccounts.use(accounts[0]) { () -> (String?, String?) in
+                    let q = Widget.runAgy("/quota")
+                    return (q.output, q.output == nil ? nil : Widget.runAgy("/credits").output)
+                }
+                guard let r = r else {
+                    DispatchQueue.main.async { self.agyBusy() }
+                    return
+                }
+                quota = r.0; credits = r.1; accEmail = accounts[0]
+            } else {
+                let q = Widget.runAgy("/quota")
+                quota = q.output; missing = q.missing
+                if quota != nil { credits = Widget.runAgy("/credits").output }
             }
             // сеть пропала, пока agy работал, — его «нет входа» не верим
             if !missing && !Net.up() {
                 DispatchQueue.main.async { self.agyOffline() }
                 return
             }
-            let email = Widget.readAgyEmail()
+            let email = accEmail ?? AgyAccounts.liveEmail() ?? Widget.readAgyEmail()
             DispatchQueue.main.async { self.fetchAgyDone(quota, credits, email, missing) }
+        }
+    }
+
+    // аккаунт занят запуском ace — цифры не трогаем, повторим через минуту
+    private func agyBusy() {
+        agyFetching = false
+        agyNextFetch = Date().addingTimeInterval(60)
+        if agyGroups.isEmpty { setAgyStatus(Widget.busyText, false) }
+        updateView()
+    }
+
+    // идёт вход в новый аккаунт: agy пока без входа — раздел не трогаем, проверяем чаще
+    private func agyWaitAdding() {
+        agyFetching = false
+        agyNextFetch = Date().addingTimeInterval(15)
+        setAgyStatus(Widget.addingText, false)
+        updateView()
+    }
+
+    // меню «Добавить аккаунт» → Antigravity: текущий вход запоминаем и открываем agy с /logout —
+    // в нём входят другим аккаунтом (/login); виджет сам сохранит новый вход и вернёт прежний
+    func addAgyAccount() {
+        DispatchQueue.global().async {
+            let ok = AgyAccounts.startAdding()
+            if ok, let exe = Widget.agyExe {
+                Shell.runInTerminal("'\(exe)' -i /logout")
+            }
+            DispatchQueue.main.async {
+                self.setAgyStatus(ok ? Widget.addingText : "Не удалось начать: Antigravity занят или в нём нет входа", !ok)
+                self.agyNextFetch = Date().addingTimeInterval(20)
+                if !self.popover.isShown || self.preview { self.showWidget() }
+                self.updateView()
+            }
         }
     }
 
@@ -575,7 +760,9 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         agyMissing = missing
         agyNoAuth = false
         agyChecked = true
-        if let e = email { agyEmail = e }
+        if let e = email { agyEmail = e; Extra.mainAgyEmail = e }
+        providersScan = .distantPast
+        syncProviders()
         var problem: String?
         if missing {
             setAgyStatus("", false)
@@ -616,15 +803,23 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     }
 
     func parseAgy(_ text: String, _ problem: inout String?) -> Bool {
-        guard let d = J.embedded(text) else { return false }
+        guard let list = Widget.agyGroupsOf(text, &problem) else { return false }
+        agyGroups = list
+        rememberAgyKeys()
+        return true
+    }
+
+    static func agyGroupsOf(_ text: String, _ problem: inout String?) -> [AgyGroup]? {
+        problem = nil
+        guard let d = J.embedded(text) else { return nil }
         if J.string(d["status"]) != "SUCCESS" {
             let r = (J.string(d["response"]) ?? J.string(d["error"]) ?? "").lowercased()
-            problem = r.contains("sign") || r.contains("auth") ? Widget.agyNoAuthText : "Antigravity вернул ошибку"
-            return false
+            problem = r.contains("sign") || r.contains("auth") ? agyNoAuthText : "Antigravity вернул ошибку"
+            return nil
         }
         guard let groups = ((d["command"] as? JSON)?["data"] as? JSON)?["groups"] as? [JSON] else {
             problem = "Antigravity не сообщил лимиты"
-            return false
+            return nil
         }
         var list: [AgyGroup] = []
         for gr in groups {
@@ -642,22 +837,25 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
                     continue
                 }
                 let l = Limit(key: id, title: "", percent: max(0, min(100, (1 - remaining) * 100)), resetsAt: Fmt.iso(b["reset_time"]))
-                if window == "5h" { g.session = l } else if window == "weekly" { g.week = l }
+                if window == "5h" { l.title = "5 часов"; l.windowSeconds = 18000; g.session = l }
+                else if window == "weekly" { l.title = "Неделя"; l.windowSeconds = 604800; g.week = l }
             }
             if g.key.isEmpty { g.key = J.string(gr["name"]) ?? "" }
-            g.title = Widget.agyTitle(g.key, J.string(gr["name"]))
+            g.title = agyTitle(g.key, J.string(gr["name"]))
             g.session?.title = g.title + " · 5 ч"
             g.week?.title = g.title + " · неделя"
             list.append(g)
         }
-        agyGroups = list
-        rememberAgyKeys()
-        return true
+        return list
     }
 
     func parseAgyCredits(_ text: String?) {
+        if let c = Widget.creditsOf(text) { agyCredits = c }
+    }
+
+    static func creditsOf(_ text: String?) -> Double? {
         let data = ((J.embedded(text) ?? [:])["command"] as? JSON)?["data"] as? JSON
-        if let c = J.double(data?["remaining_credits"]) { agyCredits = c }
+        return J.double(data?["remaining_credits"])
     }
 
     // почту Antigravity пишет в свой журнал при входе: «applyAuthResult: email=…»
@@ -676,6 +874,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         if let body = J.string(d["Body"]), parseAgy(body, &problem) { agyUpdatedAt = Fmt.iso(d["At"]) }
         parseAgyCredits(J.string(d["Credits"]))
         agyEmail = J.string(d["Email"])
+        if let e = agyEmail, !e.isEmpty { Extra.mainAgyEmail = e }
     }
 
     // для значка: первая из показанных в строке меню групп (обычно Gemini)
@@ -798,7 +997,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     var codexShort: Limit? { codexLimits.first { $0.windowSeconds <= 24 * 3600 } }
     var codexLong: Limit? { codexLimits.last { $0.windowSeconds > 24 * 3600 } }
 
-    // ---------- данные других ИИ ----------
+    // ---------- данные других ИИ и дополнительных аккаунтов ----------
     // Вход не нашли — раздел не показываем и проверяем раз в несколько минут: вдруг войдут.
     func fetchExtra(_ p: ExtraProvider) {
         if p.fetching || !extraOn(p.key) { return }
@@ -807,7 +1006,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         DispatchQueue.global().async {
             let r = Extra.fetch(p.key)
             // без сети ответ «входа нет» или ошибка ничего не значат — раздел не прячем, ждём сеть
-            if (!r.signedIn || r.problem != nil) && !Net.up() {
+            if !r.busy && (!r.signedIn || r.problem != nil) && !Net.up() {
                 DispatchQueue.main.async {
                     p.fetching = false
                     p.nextFetch = Date().addingTimeInterval(60)
@@ -820,6 +1019,12 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             }
             DispatchQueue.main.async {
                 p.fetching = false
+                if r.busy {
+                    p.nextFetch = Date().addingTimeInterval(60)
+                    if p.limits.isEmpty { p.status = Widget.busyText; p.statusIsError = false }
+                    self.updateView()
+                    return
+                }
                 let wasShown = p.signedIn
                 p.signedIn = r.signedIn
                 if !r.signedIn {
@@ -827,9 +1032,17 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
                     p.nextFetch = Date().addingTimeInterval(max(TimeInterval(self.s.refreshMinutes * 60), 300))
                 } else {
                     if !r.plan.isEmpty { p.plan = r.plan }
-                    if let e = r.email, !e.isEmpty { p.email = e }
+                    if let e = r.email, !e.isEmpty {
+                        p.email = e
+                        if p.key.hasPrefix("acc-") {
+                            p.name = Extra.accountTitle(p.key, e)
+                            if let idx = Extra.all.firstIndex(where: { $0.key == p.key }) { Extra.all[idx].name = p.name }
+                        }
+                    }
+                    p.longKey = r.longKey
                     if r.problem == nil || !r.limits.isEmpty {
                         p.limits = r.limits
+                        p.groups = r.groups
                         p.updatedAt = Date()
                     }
                     p.status = r.problem ?? ""
@@ -848,14 +1061,22 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         if !s.notify { return }
         var all: [(String, Limit)] = []
         if claudeOn {
-            if let l = session { all.append(("Claude Code", l)) }
-            all += weekly.map { ("Claude Code", $0) }
+            let name = accountName("claude", "Claude Code")
+            if let l = session { all.append((name, l)) }
+            all += weekly.map { (name, $0) }
         }
         if agyOn {
-            for g in agyGroups { for l in [g.session, g.week].compactMap({ $0 }) { all.append(("Antigravity", l)) } }
+            let name = accountName("agy", "Antigravity")
+            for g in agyGroups { for l in [g.session, g.week].compactMap({ $0 }) { all.append((name, l)) } }
         }
-        if codexOn { all += codexLimits.map { ("Codex", $0) } }
-        for p in shownExtras { all += p.limits.map { (p.name, $0) } }
+        if codexOn {
+            let name = accountName("codex", "Codex")
+            all += codexLimits.map { (name, $0) }
+        }
+        for p in shownExtras {
+            let name = accountName(p.key, p.name)
+            all += p.limits.map { (name, $0) }
+        }
         let now = Date()
         for (service, l) in all {
             for t in Widget.notifyThresholds where current(l, now) >= Double(t) {
@@ -914,6 +1135,10 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     // ---------- обновление по таймеру ----------
     func tick() {
         watchNet()
+        if waitingSvc != nil {
+            if Date() >= waitingUntil { cancelAddAccount() }
+            else if !waitingPolling && Date() >= waitingNextPoll { pollWaitingAccount() }
+        }
         if !online { updateView(); return }
         let now = Date()
         let window = TimeInterval(s.refreshMinutes * 60)
@@ -1034,7 +1259,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         }
         if agyOn { for g in agyGroups { tip.append((g.key == "3p" ? "Claude/GPT" : g.title) + " " + Fmt.pct(current(g.short, now))) } }
         if codexOn, let l = codexLimits.first { tip.append("Codex " + Fmt.pct(current(l, now))) }
-        for p in shownExtras { if let l = p.short { tip.append(p.name + " " + Fmt.pct(current(l, now))) } }
+        for p in shownExtras { if let l = p.short { tip.append(trayExtraName(p) + " " + Fmt.pct(current(l, now))) } }
         return tip.isEmpty ? "Лимиты ИИ" : "Сверху — сессия, снизу — неделя\n" + tip.joined(separator: " · ")
     }
 
@@ -1137,6 +1362,8 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     func hideWidget() {
         preview = false
         confirmLogout = false
+        choosingAccount = false
+        renamingAccount = nil
         popover.performClose(nil)
     }
 
@@ -1144,6 +1371,8 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         hiddenAt = Date()
         preview = false
         confirmLogout = false
+        choosingAccount = false
+        renamingAccount = nil
         updateView()
     }
 
@@ -1218,11 +1447,12 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         menu.addItem(.separator())
         // только те сервисы, в которые на этом Mac есть вход
         menu.addItem(submenu("Показывать", [
-            claudeAvail ? serviceToggle("Claude Code", s.showClaude, { [unowned self] v in self.s.showClaude = v; self.setLoggedOut("claude", false) }, { [unowned self] in self.fetch() }) : nil,
-            agyAvail ? serviceToggle("Antigravity", s.showAgy, { [unowned self] v in self.s.showAgy = v; self.setLoggedOut("agy", false) }, { [unowned self] in self.fetchAgy() }) : nil,
-            codexAvail ? serviceToggle("Codex", s.showCodex, { [unowned self] v in self.s.showCodex = v; self.setLoggedOut("codex", false) }, { [unowned self] in self.fetchCodex() }) : nil
+            claudeAvail ? serviceToggle(mainTitle("claude", "Claude Code"), s.showClaude, { [unowned self] v in self.s.showClaude = v; self.setLoggedOut("claude", false) }, { [unowned self] in self.fetch() }) : nil,
+            agyAvail ? serviceToggle(mainTitle("agy", "Antigravity"), s.showAgy, { [unowned self] v in self.s.showAgy = v; self.setLoggedOut("agy", false) }, { [unowned self] in self.fetchAgy() }) : nil,
+            codexAvail ? serviceToggle(mainTitle("codex", "Codex"), s.showCodex, { [unowned self] v in self.s.showCodex = v; self.setLoggedOut("codex", false) }, { [unowned self] in self.fetchCodex() }) : nil
         ].compactMap { $0 } + extras.filter { $0.signedIn }.map { p in
-            serviceToggle(p.name, extraOn(p.key), { [unowned self] v in
+            let title = p.key.hasPrefix("acc-") ? p.name : mainTitle(p.key, p.name)
+            return serviceToggle(title, extraOn(p.key), { [unowned self] v in
                 var list = self.s.hiddenExtras.split(separator: ",").map(String.init).filter { $0 != p.key && !$0.isEmpty }
                 if !v { list.append(p.key) }
                 self.s.hiddenExtras = list.joined(separator: ",")
@@ -1258,13 +1488,40 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         if agyOn { outs.append(ClosureItem("Antigravity") { [unowned self] in self.logout("agy") }) }
         if codexOn { outs.append(ClosureItem("Codex") { [unowned self] in self.logout("codex") }) }
         if !outs.isEmpty { menu.addItem(submenu("Выйти из аккаунта", outs)) }
+        var acc: [NSMenuItem] = [ClosureItem("Добавить аккаунт…") { [unowned self] in self.chooseAccount() }]
+        var mains: [(String, String)] = [("claude", "Claude Code"), ("agy", "Antigravity"), ("codex", "Codex")]
+        mains += extras.filter { !$0.key.hasPrefix("acc-") }.map { ($0.key, $0.name) }
+        for m in mains where hasAccounts(m.0) {
+            let mk = "main-" + m.0
+            acc.append(submenu(mainTitle(m.0, m.1) + " (основной)", [
+                ClosureItem("Переименовать…") { [unowned self] in self.startRenameAccount(mk) }
+            ]))
+        }
+        for p in extras where p.key.hasPrefix("acc-") {
+            let k = p.key
+            var sub: [NSMenuItem] = [ClosureItem("Переименовать…") { [unowned self] in self.startRenameAccount(k) }]
+            if let cmd = Extra.terminalCommand(k) {
+                sub.append(ClosureItem("Команда для терминала") { Widget.copyTerminalCommand(cmd) })
+            }
+            sub.append(ClosureItem("Убрать") { [unowned self] in self.removeExtraAccount(k) })
+            acc.append(submenu(p.name, sub))
+        }
+        menu.addItem(submenu("Аккаунты", acc))
         menu.addItem(ClosureItem("Закрыть") { NSApp.terminate(nil) })
         return menu
     }
 
-    // ---------- выход ----------
+    // ---------- вход и выход ----------
     // Сам виджет войти не просит — берёт вход, который уже есть у Claude Code, Codex, Antigravity и других ИИ.
     // Выходим их же командами: «claude auth logout» удаляет вход из связки ключей.
+    // есть ли ИИ на компьютере — в «Добавить аккаунт» показываем только установленные
+    static func installed(_ svc: String) -> Bool {
+        if svc == "claude" { return claudeExe != nil }
+        if svc == "codex" { return codexExe != nil }
+        if svc == "geminicli" { return Shell.find("gemini") != nil }
+        return true   // Antigravity — только когда в нём есть вход; свои ИИ — по их описанию
+    }
+
     static func serviceName(_ target: String) -> String { target == "agy" ? "Antigravity" : target == "codex" ? "Codex" : "Claude Code" }
 
     // подтверждение показываем в самой панели
@@ -1321,6 +1578,205 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         fetchAgy()
         fetchCodex()
         updateView()
+    }
+
+    // ---------- дополнительные аккаунты ----------
+    var choosingAccount = false, waitingPolling = false
+    var waitingSvc: String?, waitingDir: String?, renamingAccount: String?
+    var waitingNum = 0
+    var waitingUntil = Date.distantPast, waitingNextPoll = Date.distantPast
+    var renameText = ""
+
+    func showAccountNotice(_ svc: String, _ text: String, error: Bool) {
+        accountNotice = text
+        accountNoticeError = error
+        accountNoticeUntil = Date().addingTimeInterval(error ? 60 : 300)
+    }
+
+    func chooseAccount() {
+        confirmLogout = false
+        renamingAccount = nil
+        choosingAccount = true
+        providersScan = .distantPast
+        syncProviders()
+        if !popover.isShown || preview { showWidget() }
+        updateView()
+    }
+
+    func startAddAccount(_ svc: String) {
+        choosingAccount = false
+        if svc == "agy" {
+            addAgyAccount()
+            return
+        }
+        addFolderAccount(svc)
+    }
+
+    func addFolderAccount(_ svc: String) {
+        if waitingSvc != nil { cancelAddAccount() }
+        guard let spec = Extra.accountSpecFor(svc) else { return }
+        let fm = FileManager.default
+        let baseDir = Extra.accountsDir + "/" + svc
+        var folder: String?
+        do {
+            try fm.createDirectory(atPath: baseDir, withIntermediateDirectories: true)
+            var n = 1
+            while fm.fileExists(atPath: baseDir + "/\(n)") { n += 1 }
+            let dir = baseDir + "/\(n)"
+            folder = dir
+            try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            Extra.waitingDir = dir
+
+            var login = spec.login.replacingOccurrences(of: "{account}", with: "\"\(dir)\"")
+            if svc == "claude", login.hasPrefix("claude "), let exe = Widget.claudeExe {
+                login = "\"\(exe)\"" + String(login.dropFirst(6))
+            } else if svc == "codex", login.hasPrefix("codex "), let exe = Widget.codexExe {
+                login = "\"\(exe)\"" + String(login.dropFirst(5))
+            } else if svc == "geminicli", login == "gemini", let exe = Shell.find("gemini") {
+                login = "\"\(exe)\""
+            }
+            let cmd: String
+            if !spec.env.isEmpty && !login.isEmpty {
+                cmd = "export \(spec.env)=\"\(dir)\" && \(login)"
+            } else if !spec.env.isEmpty {
+                cmd = "export \(spec.env)=\"\(dir)\""
+            } else {
+                cmd = login
+            }
+            Shell.runInTerminal(cmd)
+
+            waitingSvc = svc
+            waitingDir = dir
+            waitingNum = n
+            waitingPolling = false
+            waitingUntil = Date().addingTimeInterval(1800)
+            waitingNextPoll = Date().addingTimeInterval(5)
+        } catch {
+            Extra.waitingDir = nil
+            waitingSvc = nil
+            waitingDir = nil
+            waitingNum = 0
+            if let dir = folder { try? fm.removeItem(atPath: dir) }
+            showAccountNotice(svc, "Не удалось открыть окно входа", error: true)
+        }
+        updateView()
+    }
+
+    func cancelAddAccount() {
+        let dir = waitingDir
+        waitingSvc = nil
+        waitingDir = nil
+        waitingNum = 0
+        waitingPolling = false
+        Extra.waitingDir = nil
+        if let dir = dir, !dir.isEmpty {
+            DispatchQueue.global().async { try? FileManager.default.removeItem(atPath: dir) }
+        }
+        updateView()
+    }
+
+    func pollWaitingAccount() {
+        guard let svc = waitingSvc, let dir = waitingDir, !waitingPolling else { return }
+        let num = waitingNum
+        waitingPolling = true
+        waitingNextPoll = Date().addingTimeInterval(5)
+        Extra.mainAgyEmail = agyEmail
+        DispatchQueue.global().async {
+            let check = Extra.checkWaitingFolder(svc, dir, num)
+            DispatchQueue.main.async {
+                self.waitingPolling = false
+                if self.waitingSvc != svc || self.waitingDir != dir { return }
+                if !check.ready {
+                    self.waitingNextPoll = Date().addingTimeInterval(5)
+                    return
+                }
+                let ai = Extra.aiName(svc)
+                self.waitingSvc = nil
+                self.waitingDir = nil
+                self.waitingNum = 0
+                Extra.waitingDir = nil
+                if check.duplicate {
+                    DispatchQueue.global().async { try? FileManager.default.removeItem(atPath: dir) }
+                    Notify.post(ai, "Этот аккаунт уже есть")
+                    self.showAccountNotice(svc, "Этот аккаунт уже есть", error: true)
+                    self.updateView()
+                    return
+                }
+                let label = (check.email?.isEmpty == false) ? check.email! : "аккаунт \(num)"
+                Notify.post("Лимиты ИИ", "Добавлен \(ai) · \(label)")
+                self.providersScan = .distantPast
+                self.syncProviders()
+                let key = "acc-\(svc)-\(num)"
+                if let ep = self.extraFor(key) {
+                    ep.signedIn = true
+                    if let e = check.email, !e.isEmpty { ep.email = e }
+                    ep.name = Extra.accountTitle(key, label)
+                    ep.nextFetch = .distantPast
+                    self.fetchExtra(ep)
+                }
+                self.updateView()
+            }
+        }
+    }
+
+    func startRenameAccount(_ key: String) {
+        confirmLogout = false
+        choosingAccount = false
+        let main = key.hasPrefix("main-")
+        let def = (main ? mainEmail(String(key.dropFirst(5))) : Extra.getDefaultLabel(key)) ?? ""
+        renameText = Extra.getCustomName(key) ?? def
+        renamingAccount = key
+        if !popover.isShown || preview { showWidget() }
+        updateView()
+    }
+
+    func saveRenameAccount() {
+        guard let key = renamingAccount else { return }
+        let val = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        renamingAccount = nil
+        let def = key.hasPrefix("main-") ? mainEmail(String(key.dropFirst(5))) : Extra.getDefaultLabel(key)
+        if val.isEmpty || val == def {
+            s.accountNames.removeValue(forKey: key)
+        } else {
+            s.accountNames[key] = val
+        }
+        Extra.setCustomNames(s.accountNames)
+        saveSettings()
+        if let ep = extraFor(key) {
+            ep.name = Extra.accountTitle(key, ep.email ?? def)
+            if let idx = Extra.all.firstIndex(where: { $0.key == key }) { Extra.all[idx].name = ep.name }
+        }
+        lastIconKey = nil
+        updateView()
+    }
+
+    func cancelRenameAccount() {
+        renamingAccount = nil
+        updateView()
+    }
+
+    static func copyTerminalCommand(_ cmd: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(cmd, forType: .string)
+    }
+
+    func removeExtraAccount(_ key: String) {
+        DispatchQueue.global().async {
+            let ok = Extra.removeAccount(key)
+            DispatchQueue.main.async {
+                if !ok { return }
+                self.extras.removeAll { $0.key == key }
+                self.s.accountNames.removeValue(forKey: key)
+                Extra.setCustomNames(self.s.accountNames)
+                self.s.clockItems = self.s.clockItems.split(separator: ",").map(String.init).filter { !$0.isEmpty && $0 != key }.joined(separator: ",")
+                self.s.seenExtras = self.s.seenExtras.split(separator: ",").map(String.init).filter { !$0.isEmpty && $0 != key }.joined(separator: ",")
+                self.s.hiddenExtras = self.s.hiddenExtras.split(separator: ",").map(String.init).filter { !$0.isEmpty && $0 != key }.joined(separator: ",")
+                self.saveSettings()
+                self.lastIconKey = nil
+                self.updateView()
+            }
+        }
     }
 
     // ---------- возврат после нового входа ----------

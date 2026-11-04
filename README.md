@@ -11,7 +11,7 @@
 | ОС | Файл | Примечание |
 |---|---|---|
 | macOS | [AiLimitWidget.dmg](release/AiLimitWidget.dmg) | Apple Silicon и Intel, macOS 12+ |
-| Windows | [AiLimitWidget.exe](release/AiLimitWidget.exe) | один файл, установка не нужна |
+| Windows | [install.cmd](windows/install.cmd) (рекомендуется) или [AiLimitWidget.exe](release/AiLimitWidget.exe) | install.cmd собирает exe из исходника прямо на ПК |
 
 Приложения не подписаны, поэтому при первом запуске система может предупредить:
 
@@ -19,7 +19,10 @@
   `xattr -dr com.apple.quarantine /Applications/AiLimitWidget.app`.
 - **Windows** — в окне SmartScreen нажмите «Подробнее» → «Выполнить в любом случае».
   Или заранее: правый клик по скачанному exe → «Свойства» → галочка «Разблокировать» → OK — тогда окно не появится.
-  Антивирус Windows (Defender) угроз в файле не находит; окно SmartScreen пропадёт только после подписи exe сертификатом.
+  Defender может удалить скачанный exe как `Trojan:Win32/Wacatac.B!ml` — это ложное срабатывание его ML-модели на неподписанный файл.
+  Тогда используйте **install.cmd**: скачайте, запустите — он загрузит исходник, соберёт exe встроенным в Windows
+  компилятором .NET в `%LOCALAPPDATA%\AiLimitWidget`, положит ярлык на рабочий стол и запустит виджет.
+  Собранный на месте exe не помечается как скачанный, и Defender его не трогает.
 
 ## Возможности
 

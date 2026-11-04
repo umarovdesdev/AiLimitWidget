@@ -1941,7 +1941,7 @@ namespace AiLimitWidget
         [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hwnd, int index);
         [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr hwnd, int index, int value);
-        static readonly IntPtr HWND_TOP = IntPtr.Zero;
+        static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOREDRAW = 0x8, SWP_NOACTIVATE = 0x10, SWP_NOOWNERZORDER = 0x200;
         const int GWL_EXSTYLE = -20, WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000, WS_EX_TRANSPARENT = 0x20;
         const double ChevronOverlap = -7.8;   // надпись заходит на пустое поле кнопки ^ (клики проходят насквозь)
@@ -1995,7 +1995,7 @@ namespace AiLimitWidget
 
             // надпись пропускает мышь насквозь, поэтому наведение узнаём по положению курсора
             hoverTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(120) };
-            hoverTimer.Tick += (s, e) => CheckHover();
+            hoverTimer.Tick += (s, e) => { CheckHover(); KeepClockOnTop(); };
             hoverTimer.Start();
         }
 
@@ -2003,7 +2003,7 @@ namespace AiLimitWidget
         {
             var w = new Window {
                 WindowStyle = WindowStyle.None, AllowsTransparency = true, Background = Brushes.Transparent, ResizeMode = ResizeMode.NoResize,
-                ShowInTaskbar = false, ShowActivated = false, SizeToContent = SizeToContent.WidthAndHeight,
+                ShowInTaskbar = false, ShowActivated = false, Topmost = true, SizeToContent = SizeToContent.WidthAndHeight,
                 FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI"), Content = clockBox, Title = "AI limits" };
             TextOptions.SetTextFormattingMode(w, TextFormattingMode.Display);
             w.SourceInitialized += (s, e) =>
@@ -2191,16 +2191,15 @@ namespace AiLimitWidget
         const int GWL_STYLE = -16, WS_CHILD = 0x40000000;
         const uint WS_POPUP = 0x80000000;
 
-        // Надпись — дочернее окно самой панели задач. Когда открыт «Пуск», поиск или меню трея,
-        // Windows поднимает панель задач в системный слой выше всех окон (даже «поверх всех»),
-        // и отдельное окно оказывалось под ней — надпись пропадала, пока меню не закроют.
-        // Дочернее окно поднимается вместе с панелью и видно всегда.
-        void EmbedInTaskbar(IntPtr hwnd, IntPtr bar)
+        // Надпись — обычное окно «поверх всех», НЕ дочернее и НЕ принадлежащее панели задач.
+        // Окно другого процесса внутри explorer.exe связывает их очереди ввода: любая заминка виджета
+        // подвешивала всю панель задач (AppHangXProcB1 у explorer.exe). Поэтому окно только своё,
+        // а чтобы надпись не оставалась под панелью после «Пуска», поиска или меню трея, таймер поднимает её снова.
+        void KeepClockOnTop()
         {
-            if (hwnd == IntPtr.Zero || bar == clockOwner) return;
-            SetWindowLong(hwnd, GWL_STYLE, (int)((uint)GetWindowLong(hwnd, GWL_STYLE) & ~WS_POPUP) | WS_CHILD);
-            SetParent(hwnd, bar);
-            clockOwner = bar;
+            if (clock == null || !clock.IsVisible) return;
+            IntPtr hwnd = new WindowInteropHelper(clock).Handle;
+            if (hwnd != IntPtr.Zero) SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         }
 
         void PlaceClockLabel()
@@ -2218,7 +2217,6 @@ namespace AiLimitWidget
                 if (ok)
                 {
                     IntPtr hwnd = new WindowInteropHelper(clock).EnsureHandle();
-                    EmbedInTaskbar(hwnd, bar);
                     var source = PresentationSource.FromVisual(clock);
                     double scale = source != null && source.CompositionTarget != null ? source.CompositionTarget.TransformToDevice.M11 : 1;
                     // окно внутри панели задач само не растёт, когда добавляются столбцы (например, второй аккаунт), —
@@ -2236,8 +2234,7 @@ namespace AiLimitWidget
                     int labelHeightPx = (int)Math.Ceiling(h * scale);
                     int x = (int)(nr.Left - labelWidthPx + ChevronOverlap * scale);
                     int y = (tb.Top + tb.Bottom) / 2 - labelHeightPx / 2;
-                    // координаты дочернего окна — от левого верхнего угла панели задач
-                    SetWindowPos(hwnd, HWND_TOP, x - tb.Left, y - tb.Top, labelWidthPx, labelHeightPx, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER);
+                    SetWindowPos(hwnd, HWND_TOPMOST, x, y, labelWidthPx, labelHeightPx, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
                     if (!clock.IsVisible) clock.Show();
                     return;
                 }

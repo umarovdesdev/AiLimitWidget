@@ -2234,7 +2234,12 @@ namespace AiLimitWidget
                     int labelHeightPx = (int)Math.Ceiling(h * scale);
                     int x = (int)(nr.Left - labelWidthPx + ChevronOverlap * scale);
                     int y = (tb.Top + tb.Bottom) / 2 - labelHeightPx / 2;
-                    SetWindowPos(hwnd, HWND_TOPMOST, x, y, labelWidthPx, labelHeightPx, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                    // размер окна задаёт WPF (Width/Height выше): если задавать его ещё и здесь, округления WPF и наши
+                    // спорят — SizeChanged вызывает PlaceClockLabel снова и снова, и таймер наведения не успевает сработать.
+                    // Двигаем окно, только если оно и правда не на месте.
+                    RECT cur;
+                    if (!GetWindowRect(hwnd, out cur) || cur.Left != x || cur.Top != y)
+                        SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
                     if (!clock.IsVisible) clock.Show();
                     return;
                 }

@@ -93,7 +93,7 @@ namespace AiLimitWidget
     // Новые модели (впервые увиденные меньше NewDays дней назад) помечаются «NEW»; когда впервые увидели — в agy-models.json.
     static class AgyModels
     {
-        const int NewDays = 7;
+        const int NewDays = 3;   // сколько дней новая модель отмечена словом «новая»
         static readonly object gate = new object();
         static Dictionary<string, DateTime> seen;
         static readonly string[] Plain = { "gemini", "pro", "flash", "lite", "high", "medium", "low", "xhigh", "max", "minimal", "thinking", "preview" };
@@ -4101,13 +4101,16 @@ namespace AiLimitWidget
                 string name = m.Name.StartsWith("Gemini ", StringComparison.Ordinal) ? m.Name.Substring(7)
                             : m.Name.StartsWith("Claude ", StringComparison.Ordinal) ? m.Name.Substring(7) : m.Name;
                 if (g.Title.EndsWith(name, StringComparison.Ordinal)) continue;   // «Gemini 4 Argon» в группе «Gemini 4 Argon»
+                var vm = System.Text.RegularExpressions.Regex.Match(name, @"^([\d.]+) (.+)$");
+                if (vm.Success) name = vm.Groups[2].Value + " " + vm.Groups[1].Value;   // «4 Hydrogen» → «Hydrogen 4», «3.8 Flash» → «Flash 3.8»
+                name = name.Replace("GPT OSS", "GPT-OSS");
                 if (shown++ > 0) line.Inlines.Add(new System.Windows.Documents.Run(" · "));
                 line.Inlines.Add(new System.Windows.Documents.Run(name) { Foreground = B(m.IsNew ? "#F2F2F7" : "#AEAEB2") });
-                if (m.IsNew) line.Inlines.Add(new System.Windows.Documents.Run(" NEW") { Foreground = B("#30D158"), FontSize = 9, FontWeight = FontWeights.Bold });
+                if (m.IsNew) line.Inlines.Add(new System.Windows.Documents.Run(" новая") { Foreground = B("#30D158"), FontSize = 10 });
             }
             if (shown == 0) return null;
             line.ToolTip = string.Join("\n", g.ModelList.Select(m => m.Name + (m.Levels.Count > 0 ? " — " + string.Join(", ", m.Levels) : "")
-                + (m.IsNew ? " — новая (за 7 дней)" : "") + (m.NoOwnGroup ? " — своей строки лимита нет, расход в «" + g.Title + "»" : "")));
+                + (m.IsNew ? " — новая: появилась меньше 3 дней назад" : "") + (m.NoOwnGroup ? " — своей строки лимита нет, расход в «" + g.Title + "»" : "")));
             return line;
         }
 

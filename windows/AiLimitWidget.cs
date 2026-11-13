@@ -4088,29 +4088,27 @@ namespace AiLimitWidget
 
         UIElement AgyRow(AgyGroup g, DateTime now) { return AgyRow(g, now, false); }
 
-        // модели группы плашками: «Gemini 4 Argon  low · medium · high», новая — с зелёной меткой NEW
-        UIElement ModelChips(AgyGroup g)
+        // модели группы одной строкой в заголовке: «4 Hydrogen NEW · 3.8 Flash» — без уровней и служебных моделей;
+        // полный список с уровнями — во всплывающей подсказке. null — показывать нечего (единственная модель = название группы)
+        UIElement ModelLine(AgyGroup g)
         {
-            var wrap = new WrapPanel { Margin = new Thickness(12, 2, 0, 0) };
+            var line = new TextBlock { FontSize = 11, Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Bottom,
+                                       TextTrimming = TextTrimming.CharacterEllipsis, Foreground = B("#8E8E93") };
+            int shown = 0;
             foreach (var m in g.ModelList.OrderByDescending(x => x.IsNew))
             {
-                var row = new StackPanel { Orientation = Orientation.Horizontal };
-                row.Children.Add(new TextBlock { Text = m.Name, FontSize = 11, Foreground = B(m.IsNew ? "#F2F2F7" : "#C7C7CC"), VerticalAlignment = VerticalAlignment.Center });
-                if (m.Levels.Count > 0)
-                    row.Children.Add(new TextBlock { Text = "  " + string.Join(" · ", m.Levels), FontSize = 10.5, Foreground = B("#8E8E93"), VerticalAlignment = VerticalAlignment.Center });
-                if (m.IsNew)
-                    row.Children.Add(new Border { Background = B("#30D158"), CornerRadius = new CornerRadius(3), Padding = new Thickness(4, 0, 4, 0), Margin = new Thickness(6, 0, 0, 0),
-                                                  VerticalAlignment = VerticalAlignment.Center,
-                                                  Child = new TextBlock { Text = "NEW", FontSize = 9, FontWeight = FontWeights.Bold, Foreground = B("#0B0B0C") } });
-                var chip = new Border { Child = row, CornerRadius = new CornerRadius(4), Padding = new Thickness(6, 1, 6, 2), Margin = new Thickness(0, 3, 5, 0),
-                                        Background = B(m.IsNew ? "#2630D158" : "#1FFFFFFF") };
-                string tip = m.Name + (m.Levels.Count > 0 ? " — уровни: " + string.Join(", ", m.Levels) : "");
-                if (m.IsNew) tip += "\nНовая модель: появилась в Antigravity за последние 7 дней";
-                if (m.NoOwnGroup) tip += "\nСвоей строки лимита в Antigravity у модели нет — поэтому показана в «" + g.Title + "»";
-                chip.ToolTip = tip;
-                wrap.Children.Add(chip);
+                if (!m.Name.Any(char.IsDigit)) continue;   // служебная модель без версии (Gemini Pro Orchestrator) — только в подсказке
+                string name = m.Name.StartsWith("Gemini ", StringComparison.Ordinal) ? m.Name.Substring(7)
+                            : m.Name.StartsWith("Claude ", StringComparison.Ordinal) ? m.Name.Substring(7) : m.Name;
+                if (g.Title.EndsWith(name, StringComparison.Ordinal)) continue;   // «Gemini 4 Argon» в группе «Gemini 4 Argon»
+                if (shown++ > 0) line.Inlines.Add(new System.Windows.Documents.Run(" · "));
+                line.Inlines.Add(new System.Windows.Documents.Run(name) { Foreground = B(m.IsNew ? "#F2F2F7" : "#AEAEB2") });
+                if (m.IsNew) line.Inlines.Add(new System.Windows.Documents.Run(" NEW") { Foreground = B("#30D158"), FontSize = 9, FontWeight = FontWeights.Bold });
             }
-            return wrap;
+            if (shown == 0) return null;
+            line.ToolTip = string.Join("\n", g.ModelList.Select(m => m.Name + (m.Levels.Count > 0 ? " — " + string.Join(", ", m.Levels) : "")
+                + (m.IsNew ? " — новая (за 7 дней)" : "") + (m.NoOwnGroup ? " — своей строки лимита нет, расход в «" + g.Title + "»" : "")));
+            return line;
         }
 
         // lighter — группа второго аккаунта: тот же вид, цвет светлее
@@ -4133,8 +4131,12 @@ namespace AiLimitWidget
                 Grid.SetColumn(models, 2);
                 head.Children.Add(models);
             }
+            else if (g.ModelList.Count > 0)
+            {
+                var models = ModelLine(g);
+                if (models != null) { Grid.SetColumn(models, 2); head.Children.Add(models); }
+            }
             panel.Children.Add(head);
-            if (g.ModelList.Count > 0) panel.Children.Add(ModelChips(g));
 
             var cols = new Grid { Margin = new Thickness(0, 3, 0, 0) };
             cols.ColumnDefinitions.Add(new ColumnDefinition());

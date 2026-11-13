@@ -23,6 +23,7 @@ final class Limit {
 // группа моделей Antigravity: у каждой свой 5-часовой и недельный лимит
 final class AgyGroup {
     var key = "", title = "", models = ""
+    var modelList: [AgyModel] = []   // модели группы из «agy models»: имя, уровни, новая ли
     var session: Limit?, week: Limit?
     var sessionOff = false   // 5-часовое окно отключено сервисом (упёрлись в недельный лимит)
 
@@ -644,6 +645,14 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         return Proc.run(exe, ["-p", command, "--output-format", "json"], env: env)
     }
 
+    // «agy models» — список моделей аккаунта (бесплатно, модель не запускается); nil — не ответил
+    static func runAgyModels() -> String? {
+        guard let exe = agyExe else { return nil }
+        var env = Shell.environment
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
+        return Proc.run(exe, ["models"], env: env).output
+    }
+
     // probe — пробный запрос для скрытого после выхода Antigravity: ответил — значит, снова вошли
     func fetchAgy(probe: Bool = false) {
         if agyFetching || (!s.showAgy && !probe) { return }
@@ -668,31 +677,32 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
                 DispatchQueue.main.async { self.agyWaitAdding() }
                 return
             }
-            var quota: String?, credits: String?, accEmail: String?
+            var quota: String?, credits: String?, modelsText: String?, accEmail: String?
             var missing = false
             if accounts.count > 1 {
                 // несколько аккаунтов: основной опрашиваем внутри блокировки AgyAccounts, чтобы не прочитать чужой вход
-                let r = AgyAccounts.use(accounts[0]) { () -> (String?, String?) in
+                let r = AgyAccounts.use(accounts[0]) { () -> (String?, String?, String?) in
                     let q = Widget.runAgy("/quota")
-                    return (q.output, q.output == nil ? nil : Widget.runAgy("/credits").output)
+                    guard q.output != nil else { return (nil, nil, nil) }
+                    return (q.output, Widget.runAgy("/credits").output, Widget.runAgyModels())
                 }
                 guard let r = r else {
                     DispatchQueue.main.async { self.agyBusy() }
                     return
                 }
-                quota = r.0; credits = r.1; accEmail = accounts[0]
+                quota = r.0; credits = r.1; modelsText = r.2; accEmail = accounts[0]
             } else {
                 let q = Widget.runAgy("/quota")
                 quota = q.output; missing = q.missing
-                if quota != nil { credits = Widget.runAgy("/credits").output }
+                if quota != nil { credits = Widget.runAgy("/credits").output; modelsText = Widget.runAgyModels() }
             }
             // сеть пропала, пока agy работал, — его «нет входа» не верим
             if !missing && !Net.up() {
                 DispatchQueue.main.async { self.agyOffline() }
                 return
             }
-            let email = accEmail ?? AgyAccounts.liveEmail() ?? Widget.readAgyEmail()
-            DispatchQueue.main.async { self.fetchAgyDone(quota, credits, email, missing) }
+            let email = accEmail ?? AgyAccounts.mainEmail() ?? Widget.readAgyEmail()
+            DispatchQueue.main.async { self.fetchAgyDone(quota, credits, modelsText, email, missing) }
         }
     }
 
@@ -755,7 +765,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         updateView()
     }
 
-    private func fetchAgyDone(_ quota: String?, _ credits: String?, _ email: String?, _ missing: Bool) {
+    private func fetchAgyDone(_ quota: String?, _ credits: String?, _ modelsText: String?, _ email: String?, _ missing: Bool) {
         agyFetching = false
         agyMissing = missing
         agyNoAuth = false
@@ -767,7 +777,8 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
         if missing {
             setAgyStatus("", false)
             agyNextFetch = Date().addingTimeInterval(600)
-        } else if let q = quota, parseAgy(q, &problem) {
+        } else if let q = quota, parseAgy(q, AgyModels.parseList(modelsText).isEmpty ? agyModelsText : modelsText, &problem) {
+            if !AgyModels.parseList(modelsText).isEmpty { agyModelsText = modelsText }
             agyUpdatedAt = Date()
             setAgyStatus("", false)
             parseAgyCredits(credits)
@@ -775,6 +786,7 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             var cache: [String: Any] = ["At": Fmt.isoString(agyUpdatedAt!), "Body": q]
             if let c = credits { cache["Credits"] = c }
             if let e = agyEmail { cache["Email"] = e }
+            if let m = agyModelsText { cache["Models"] = m }
             J.write(cache, agyCachePath)
             checkNotifications()
         } else if quota != nil, problem == Widget.agyNoAuthText {
@@ -802,8 +814,11 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
             .replacingOccurrences(of: " and ", with: " и ")
     }
 
-    func parseAgy(_ text: String, _ problem: inout String?) -> Bool {
+    var agyModelsText: String?   // последний ответ «agy models» основного аккаунта
+
+    func parseAgy(_ text: String, _ modelsText: String?, _ problem: inout String?) -> Bool {
         guard let list = Widget.agyGroupsOf(text, &problem) else { return false }
+        AgyModels.attach(list, modelsText, email: agyEmail)
         agyGroups = list
         rememberAgyKeys()
         return true
@@ -871,9 +886,10 @@ final class Widget: NSObject, ObservableObject, NSPopoverDelegate {
     func loadAgyCache() {
         guard let d = J.file(agyCachePath) else { return }
         var problem: String?
-        if let body = J.string(d["Body"]), parseAgy(body, &problem) { agyUpdatedAt = Fmt.iso(d["At"]) }
+        agyEmail = J.string(d["Email"])   // до parseAgy: по почте берутся сохранённые модели
+        agyModelsText = J.string(d["Models"])
+        if let body = J.string(d["Body"]), parseAgy(body, agyModelsText, &problem) { agyUpdatedAt = Fmt.iso(d["At"]) }
         parseAgyCredits(J.string(d["Credits"]))
-        agyEmail = J.string(d["Email"])
         if let e = agyEmail, !e.isEmpty { Extra.mainAgyEmail = e }
     }
 

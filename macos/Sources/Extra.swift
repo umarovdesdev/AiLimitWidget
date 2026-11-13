@@ -793,11 +793,12 @@ enum Extra {
 
     static func agyExtra(_ key: String, _ email: String) -> ExtraResult {
         if AgyAccounts.isAdding { return ExtraResult(busy: true) }
-        let pair = AgyAccounts.use(email) { () -> (String?, String?) in
+        let pair = AgyAccounts.use(email) { () -> (String?, String?, String?) in
             let q = Widget.runAgy("/quota")
-            return (q.output, q.output == nil ? nil : Widget.runAgy("/credits").output)
+            guard q.output != nil else { return (nil, nil, nil) }
+            return (q.output, Widget.runAgy("/credits").output, Widget.runAgyModels())
         }
-        guard let (quota, credits) = pair else { return ExtraResult(busy: true) }
+        guard let (quota, credits, modelsText) = pair else { return ExtraResult(busy: true) }
         guard let quota = quota, !quota.isEmpty else {
             return ExtraResult(email: email, problem: "Antigravity не ответил — повторю позже")
         }
@@ -805,6 +806,7 @@ enum Extra {
         guard let groups = Widget.agyGroupsOf(quota, &problem) else {
             return ExtraResult(email: email, problem: problem == Widget.agyNoAuthText ? expiredAccountText : (problem ?? "Antigravity вернул ошибку"))
         }
+        AgyModels.attach(groups, modelsText, email: email)
         let cr = Widget.creditsOf(credits)
         var r = ExtraResult(plan: (cr ?? 0) > 0 ? "кредиты: \(Int(cr!.rounded()))" : "", email: email)
         for g in groups {

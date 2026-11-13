@@ -329,8 +329,10 @@ struct AgyRow: View {
             HStack(spacing: 0) {
                 Dot(color, 6).padding(.trailing, 6)
                 Text(g.title).font(.system(size: 12.5)).foregroundColor(Ink.body)
-                if !g.models.isEmpty {
+                if g.modelList.isEmpty, !g.models.isEmpty {   // список моделей ещё не получен — подпись из /quota
                     Text(g.models).font(.system(size: 11)).foregroundColor(Ink.faint).lineLimit(1).truncationMode(.tail).padding(.leading, 6)
+                } else if let line = modelLine {
+                    line.font(.system(size: 11)).lineLimit(1).truncationMode(.tail).padding(.leading, 6).help(AgyModels.tooltip(g))
                 }
                 Spacer(minLength: 0)
             }
@@ -348,6 +350,20 @@ struct AgyRow: View {
             }
         }
         .padding(.top, 10)
+    }
+}
+
+extension AgyRow {
+    // модели группы одной строкой: «Hydrogen 4 новая · Flash 3.8»; nil — показывать нечего
+    var modelLine: Text? {
+        var line: Text?
+        for m in g.modelList.sorted(by: { $0.isNew && !$1.isNew }) {
+            guard let name = AgyModels.shortName(m, in: g) else { continue }
+            var part = Text(name).foregroundColor(m.isNew ? Color(hex: "#F2F2F7") : Ink.secondary)
+            if m.isNew { part = part + Text(" новая").font(.system(size: 10)).foregroundColor(Color(hex: "#30D158")) }
+            line = line.map { $0 + Text(" · ").foregroundColor(Ink.tertiary) + part } ?? part
+        }
+        return line
     }
 }
 

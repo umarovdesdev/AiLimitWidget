@@ -155,6 +155,88 @@ namespace AiLimitWidget
             if (name == id && level != null && name.EndsWith("-" + level, StringComparison.Ordinal)) name = name.Substring(0, name.Length - level.Length - 1);
         }
 
+        static string ListsPath
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AiLimitWidget", "agy-model-lists.json"); }
+        }
+
+        static string AceModelsPath
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "skills", "ace", "state", "models.json"); }
+        }
+
+        // свежий ответ «agy models» запоминаем по почте: пока аккаунт занят (ace выполняет на нём задачу), его модели берутся отсюда
+        static void Remember(string email, string text)
+        {
+            if (string.IsNullOrEmpty(email)) return;
+            lock (gate)
+                try
+                {
+                    var js = new JavaScriptSerializer();
+                    var d = File.Exists(ListsPath) ? js.DeserializeObject(File.ReadAllText(ListsPath, Encoding.UTF8)) as Dictionary<string, object> : null;
+                    d = d ?? new Dictionary<string, object>();
+                    if (Convert.ToString(Get(d, email), CultureInfo.InvariantCulture) == text) return;
+                    d[email] = text;
+                    Directory.CreateDirectory(Path.GetDirectoryName(ListsPath));
+                    File.WriteAllText(ListsPath, js.Serialize(d), new UTF8Encoding(false));
+                }
+                catch (Exception) { }
+        }
+
+        static object Get(Dictionary<string, object> d, string key) { object v; return d != null && key != null && d.TryGetValue(key, out v) ? v : null; }
+
+        // список моделей аккаунта, когда agy сейчас не ответил: свой сохранённый, иначе тот, что сохранил ace (он спрашивает agy models при каждом запуске)
+        static string Stored(string email)
+        {
+            var js = new JavaScriptSerializer();
+            try
+            {
+                var own = File.Exists(ListsPath) ? js.DeserializeObject(File.ReadAllText(ListsPath, Encoding.UTF8)) as Dictionary<string, object> : null;
+                string t = Convert.ToString(Get(own, email ?? ""), CultureInfo.InvariantCulture);
+                if (ParseList(t).Count > 0) return t;
+            }
+            catch (Exception) { }
+            try
+            {
+                var ace = File.Exists(AceModelsPath) ? js.DeserializeObject(File.ReadAllText(AceModelsPath, Encoding.UTF8)) as Dictionary<string, object> : null;
+                var acc = Get(Get(ace, "accounts") as Dictionary<string, object>, email ?? "") as Dictionary<string, object>;
+                var ids = Get(acc, "ids") as System.Collections.IEnumerable;
+                if (ids == null) return null;
+                var sb = new StringBuilder();
+                foreach (object o in ids) { string id = Convert.ToString(o, CultureInfo.InvariantCulture); sb.Append(id).Append('\t').Append(TitleOf(id)).Append('\n'); }
+                return sb.ToString();
+            }
+            catch (Exception) { return null; }
+        }
+
+        // название по id, когда agy его не прислал: «claude-opus-4-6-thinking» → «Claude Opus 4.6 (Thinking)»
+        internal static string TitleOf(string id)
+        {
+            var words = id.Split('-').ToList();
+            string level = words.Count > 1 && LevelOrder.Contains(words[words.Count - 1]) ? words[words.Count - 1] : null;
+            if (level != null) words.RemoveAt(words.Count - 1);
+            var outw = new List<string>();
+            foreach (string w in words)
+            {
+                bool digit = w.Length > 0 && w.All(char.IsDigit);
+                if (digit && outw.Count > 0 && outw[outw.Count - 1].All(c => char.IsDigit(c) || c == '.') && !outw[outw.Count - 1].Contains('.') && w.Length == 1)
+                    outw[outw.Count - 1] += "." + w;   // «5-5» → «5.5»
+                else if (w == "gpt" || w == "oss") outw.Add(w.ToUpperInvariant());
+                else if (w.Length > 0 && char.IsDigit(w[0])) outw.Add(w.ToUpperInvariant());   // «120b» → «120B», «3.8»
+                else if (w.Length > 0) outw.Add(char.ToUpperInvariant(w[0]) + w.Substring(1));
+            }
+            string name = string.Join(" ", outw);
+            return level == null ? name : name + " (" + char.ToUpperInvariant(level[0]) + level.Substring(1) + ")";
+        }
+
+        // email — чей это список: свежий запоминается, а если agy сейчас не ответил (аккаунт занят), берётся сохранённый
+        internal static void Attach(List<AgyGroup> groups, string modelsText, string email)
+        {
+            if (ParseList(modelsText).Count > 0) Remember(email, modelsText);
+            else modelsText = Stored(email);
+            Attach(groups, modelsText);
+        }
+
         // раскладывает модели по группам; groups без моделей остаются как есть (подпись из описания /quota)
         internal static void Attach(List<AgyGroup> groups, string modelsText)
         {
@@ -189,6 +271,31 @@ namespace AiLimitWidget
 
         static int Order(string level) { int i = Array.IndexOf(LevelOrder, level); return i < 0 ? 99 : i; }
 
+        // линейка модели без версии и уровня: «claude-opus-4-6-thinking» → «claude-opus», «gemini-4-argon-high» → «gemini-argon»
+        static string Line(string id)
+        {
+            return string.Join("-", id.Split('-').Where(w => w.Length > 0 && !char.IsDigit(w[0]) && !LevelOrder.Contains(w)));
+        }
+
+        static List<int> Version(string id)
+        {
+            var v = new List<int>();
+            foreach (string w in id.Split('-'))
+                if (w.Length > 0 && char.IsDigit(w[0]))
+                    foreach (string part in w.Split('.')) { int n; if (int.TryParse(new string(part.TakeWhile(char.IsDigit).ToArray()), out n)) v.Add(n); }
+            return v;
+        }
+
+        static int CompareVersion(List<int> a, List<int> b)
+        {
+            for (int i = 0; i < Math.Max(a.Count, b.Count); i++)
+            {
+                int x = i < a.Count ? a[i] : 0, y = i < b.Count ? b[i] : 0;
+                if (x != y) return x.CompareTo(y);
+            }
+            return 0;
+        }
+
         // когда каждую модель увидели впервые. Самый первый запуск: всё, что уже есть, — не новое,
         // кроме моделей Gemini с кодовым именем без своей группы лимитов (их ещё не описал /quota — значит, только что вышли)
         static Dictionary<string, DateTime> MarkSeen(IEnumerable<string> ids, List<string> groupKeys)
@@ -222,6 +329,8 @@ namespace AiLimitWidget
                     if (seen.ContainsKey(id)) continue;
                     string code = id.StartsWith("gemini", StringComparison.Ordinal) ? Codename(id) : null;
                     bool brandNew = !first || (code != null && !groupKeys.Any(k => (k ?? "").Split('-').Contains(code)));
+                    // старая версия уже известной линейки (Opus 4.6 у второго аккаунта, когда Opus 5.5 уже видели) — не новая
+                    if (brandNew && seen.Keys.Any(k => Line(k) == Line(id) && CompareVersion(Version(k), Version(id)) > 0)) brandNew = false;
                     seen[id] = brandNew ? DateTime.Now : new DateTime(2000, 1, 1);
                     changed = true;
                 }
@@ -1112,7 +1221,7 @@ namespace AiLimitWidget
             if (string.IsNullOrEmpty(quota)) return new ExtraResult { Email = email, Problem = "Antigravity не ответил — повторю позже" };
             string problem;
             var groups = Widget.AgyGroupsOf(quota, out problem);
-            if (groups != null) AgyModels.Attach(groups, pair.Length > 2 ? pair[2] : null);
+            if (groups != null) AgyModels.Attach(groups, pair.Length > 2 ? pair[2] : null, email);
             if (groups == null)
                 return new ExtraResult { Email = email, Problem = problem == Widget.AgyNoAuthText ? ExpiredAccountText : (problem ?? "Antigravity вернул ошибку") };
             double? cr = Widget.CreditsOf(credits);
@@ -2938,7 +3047,7 @@ namespace AiLimitWidget
         {
             var list = AgyGroupsOf(text, out problem);
             if (list == null) return false;
-            AgyModels.Attach(list, modelsText);
+            AgyModels.Attach(list, modelsText, agyEmail);
             agyGroups.Clear();
             agyGroups.AddRange(list);
             RememberAgyKeys();
@@ -3043,6 +3152,7 @@ namespace AiLimitWidget
                 var d = json.DeserializeObject(File.ReadAllText(agyCachePath, Encoding.UTF8)) as Dictionary<string, object>;
                 string problem;
                 agyModelsText = Convert.ToString(Get(d, "Models"), Inv);
+                agyEmail = Convert.ToString(Get(d, "Email"), Inv);   // до ParseAgy: по почте берутся сохранённые модели
                 if (ParseAgy(Convert.ToString(Get(d, "Body"), Inv), agyModelsText, out problem))
                     agyUpdatedAt = DateTime.Parse(Convert.ToString(Get(d, "At"), Inv), Inv, DateTimeStyles.RoundtripKind);
                 ParseAgyCredits(Convert.ToString(Get(d, "Credits"), Inv));

@@ -66,6 +66,7 @@ namespace AiLimitWidget
     sealed class AgyGroup
     {
         public string Key, Title, Models;
+        public List<AgyModel> ModelList = new List<AgyModel>();   // модели группы из «agy models»: имя, уровни, новая ли
         public Limit Session, Week;
         public bool SessionOff;   // 5-часовое окно отключено сервисом (упёрлись в недельный лимит)
 
@@ -76,6 +77,164 @@ namespace AiLimitWidget
         public double Used
         {
             get { return Math.Max(Session == null ? 0 : Session.Percent, Week == null ? 0 : Week.Percent); }
+        }
+    }
+
+    // одна модель Antigravity без уровня: «Gemini 4 Argon» + уровни low / medium / high
+    sealed class AgyModel
+    {
+        public string Name;
+        public readonly List<string> Levels = new List<string>();
+        public bool IsNew;        // появилась меньше NewDays дней назад
+        public bool NoOwnGroup;   // кодовое имя, а своей группы в /quota нет — лимит считается в группе, где она показана
+    }
+
+    // Модели Antigravity: «agy models» (бесплатно, без запуска модели) → к какой группе лимитов относится каждая.
+    // Новые модели (впервые увиденные меньше NewDays дней назад) помечаются «NEW»; когда впервые увидели — в agy-models.json.
+    static class AgyModels
+    {
+        const int NewDays = 7;
+        static readonly object gate = new object();
+        static Dictionary<string, DateTime> seen;
+        static readonly string[] Plain = { "gemini", "pro", "flash", "lite", "high", "medium", "low", "xhigh", "max", "minimal", "thinking", "preview" };
+        static readonly string[] LevelOrder = { "minimal", "low", "medium", "high", "xhigh", "max", "thinking" };
+
+        static string SeenPath
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AiLimitWidget", "agy-models.json"); }
+        }
+
+        // «id<TAB>название» → пары (id, название); строка «Fetching available models...» пропускается
+        internal static List<KeyValuePair<string, string>> ParseList(string text)
+        {
+            var list = new List<KeyValuePair<string, string>>();
+            foreach (string raw in (text ?? "").Split('\n'))
+            {
+                string line = raw.TrimEnd('\r');
+                int tab = line.IndexOf('\t');
+                if (tab <= 0) continue;
+                string id = line.Substring(0, tab).Trim();
+                if (!System.Text.RegularExpressions.Regex.IsMatch(id, @"^[a-z][a-z0-9.\-]+$")) continue;
+                list.Add(new KeyValuePair<string, string>(id, line.Substring(tab + 1).Trim()));
+            }
+            return list;
+        }
+
+        // кодовое имя Gemini: «gemini-4-argon-high» → «argon», у Flash / Pro — null
+        internal static string Codename(string id)
+        {
+            foreach (string w in id.Split('-'))
+                if (w.Length > 0 && !Plain.Contains(w) && !char.IsDigit(w[0])) return w;
+            return null;
+        }
+
+        // группа лимитов /quota, в которую идёт модель: Claude/GPT — «3p», Gemini с кодовым именем — своя группа (gemini-argon-…), иначе — «gemini»
+        internal static string GroupOf(string id, IEnumerable<string> groupKeys)
+        {
+            var keys = groupKeys.Where(k => !string.IsNullOrEmpty(k)).ToList();
+            if (id.StartsWith("claude", StringComparison.Ordinal) || id.StartsWith("gpt", StringComparison.Ordinal))
+                return keys.FirstOrDefault(k => k == "3p") ?? keys.FirstOrDefault(k => !k.StartsWith("gemini", StringComparison.Ordinal));
+            string code = id.StartsWith("gemini", StringComparison.Ordinal) ? Codename(id) : null;
+            if (code != null)
+            {
+                string own = keys.FirstOrDefault(k => k.Split('-').Contains(code));
+                if (own != null) return own;
+            }
+            return keys.FirstOrDefault(k => k == "gemini") ?? keys.FirstOrDefault();
+        }
+
+        // «Gemini 4 Argon (High)» → («Gemini 4 Argon», «high»); уровень из id важнее (gemini-…-xhigh)
+        static void Split(string id, string title, out string name, out string level)
+        {
+            name = string.IsNullOrEmpty(title) ? id : title;
+            level = null;
+            var m = System.Text.RegularExpressions.Regex.Match(name, @"^(.*?)\s*\(([^)]*)\)\s*$");
+            if (m.Success) { name = m.Groups[1].Value; level = m.Groups[2].Value.ToLowerInvariant(); }
+            string last = id.Substring(id.LastIndexOf('-') + 1);
+            if (LevelOrder.Contains(last)) level = last;
+            if (name == id && level != null && name.EndsWith("-" + level, StringComparison.Ordinal)) name = name.Substring(0, name.Length - level.Length - 1);
+        }
+
+        // раскладывает модели по группам; groups без моделей остаются как есть (подпись из описания /quota)
+        internal static void Attach(List<AgyGroup> groups, string modelsText)
+        {
+            var list = ParseList(modelsText);
+            if (groups == null || groups.Count == 0 || list.Count == 0) return;
+            var keys = groups.Select(g => g.Key).ToList();
+            var firstSeen = MarkSeen(list.Select(p => p.Key), keys);
+            foreach (var g in groups) g.ModelList = new List<AgyModel>();
+            foreach (var p in list)
+            {
+                string key = GroupOf(p.Key, keys);
+                var g = groups.FirstOrDefault(x => x.Key == key);
+                if (g == null) continue;
+                string name, level;
+                Split(p.Key, p.Value, out name, out level);
+                var model = g.ModelList.FirstOrDefault(x => x.Name == name);
+                if (model == null)
+                {
+                    model = new AgyModel { Name = name };
+                    string code = p.Key.StartsWith("gemini", StringComparison.Ordinal) ? Codename(p.Key) : null;
+                    model.NoOwnGroup = code != null && !(g.Key ?? "").Split('-').Contains(code);
+                    g.ModelList.Add(model);
+                }
+                if (level != null && !model.Levels.Contains(level)) model.Levels.Add(level);
+                DateTime at;
+                if (firstSeen.TryGetValue(p.Key, out at) && DateTime.Now - at < TimeSpan.FromDays(NewDays)) model.IsNew = true;
+            }
+            foreach (var g in groups)
+                foreach (var m in g.ModelList)
+                    m.Levels.Sort((a, b) => Order(a).CompareTo(Order(b)));
+        }
+
+        static int Order(string level) { int i = Array.IndexOf(LevelOrder, level); return i < 0 ? 99 : i; }
+
+        // когда каждую модель увидели впервые. Самый первый запуск: всё, что уже есть, — не новое,
+        // кроме моделей Gemini с кодовым именем без своей группы лимитов (их ещё не описал /quota — значит, только что вышли)
+        static Dictionary<string, DateTime> MarkSeen(IEnumerable<string> ids, List<string> groupKeys)
+        {
+            lock (gate)
+            {
+                bool first = false;
+                if (seen == null)
+                {
+                    seen = new Dictionary<string, DateTime>();
+                    try
+                    {
+                        if (File.Exists(SeenPath))
+                        {
+                            var d = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(SeenPath, Encoding.UTF8)) as Dictionary<string, object>;
+                            if (d != null)
+                                foreach (var kv in d)
+                                {
+                                    DateTime t;
+                                    if (DateTime.TryParse(Convert.ToString(kv.Value, CultureInfo.InvariantCulture), CultureInfo.InvariantCulture,
+                                                          DateTimeStyles.RoundtripKind, out t)) seen[kv.Key] = t;
+                                }
+                        }
+                        else first = true;
+                    }
+                    catch (Exception) { }
+                }
+                bool changed = false;
+                foreach (string id in ids)
+                {
+                    if (seen.ContainsKey(id)) continue;
+                    string code = id.StartsWith("gemini", StringComparison.Ordinal) ? Codename(id) : null;
+                    bool brandNew = !first || (code != null && !groupKeys.Any(k => (k ?? "").Split('-').Contains(code)));
+                    seen[id] = brandNew ? DateTime.Now : new DateTime(2000, 1, 1);
+                    changed = true;
+                }
+                if (changed)
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(SeenPath));
+                        File.WriteAllText(SeenPath, new JavaScriptSerializer().Serialize(seen.ToDictionary(kv => kv.Key, kv => (object)kv.Value.ToString("o", CultureInfo.InvariantCulture))),
+                                          new UTF8Encoding(false));
+                    }
+                    catch (Exception) { }
+                return new Dictionary<string, DateTime>(seen);
+            }
         }
     }
 
@@ -944,7 +1103,7 @@ namespace AiLimitWidget
                 {
                     bool m, ignored;
                     string q = Widget.RunAgy("/quota", out m);
-                    return new[] { q, q == null ? null : Widget.RunAgy("/credits", out ignored) };
+                    return new[] { q, q == null ? null : Widget.RunAgy("/credits", out ignored), q == null ? null : Widget.RunAgyModels() };
                 });
             }
             catch (Exception) { }
@@ -953,6 +1112,7 @@ namespace AiLimitWidget
             if (string.IsNullOrEmpty(quota)) return new ExtraResult { Email = email, Problem = "Antigravity не ответил — повторю позже" };
             string problem;
             var groups = Widget.AgyGroupsOf(quota, out problem);
+            if (groups != null) AgyModels.Attach(groups, pair.Length > 2 ? pair[2] : null);
             if (groups == null)
                 return new ExtraResult { Email = email, Problem = problem == Widget.AgyNoAuthText ? ExpiredAccountText : (problem ?? "Antigravity вернул ошибку") };
             double? cr = Widget.CreditsOf(credits);
@@ -2563,6 +2723,17 @@ namespace AiLimitWidget
             catch (Exception) { return null; }
         }
 
+        // «agy models» — список моделей аккаунта (бесплатно, модель не запускается); null — не ответил
+        internal static string RunAgyModels()
+        {
+            try
+            {
+                return Background.Run(AgyExe, "models", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 45000,
+                    new Dictionary<string, string> { { "AGY_CLI_DISABLE_AUTO_UPDATE", "true" } });
+            }
+            catch (Exception) { return null; }
+        }
+
         // «agy update» в фоне, без окна и отдельно от опроса: лимиты не ждут обновления.
         // Проверяем с тем же интервалом, что и лимиты; пока одно обновление идёт, второе не запускаем.
         static DateTime agyUpdateCheck = DateTime.MinValue;
@@ -2598,7 +2769,7 @@ namespace AiLimitWidget
             {
                 if (!NetUp()) { dispatcher.BeginInvoke(new Action(AgyOffline)); return; }
                 bool missing = false;
-                string quota = null, credits = null, accEmail = null;
+                string quota = null, credits = null, accEmail = null, modelsText = null;
                 List<string> accounts = null;
                 try { accounts = AgyAccounts.Prepare(); } catch (Exception) { accounts = new List<string>(); }
                 if (accounts == null) { dispatcher.BeginInvoke(new Action(AgyBusy)); return; }
@@ -2613,23 +2784,24 @@ namespace AiLimitWidget
                         {
                             bool m, ignored;
                             string q = RunAgy("/quota", out m);
-                            return new[] { q, q == null ? null : RunAgy("/credits", out ignored) };
+                            return new[] { q, q == null ? null : RunAgy("/credits", out ignored), q == null ? null : RunAgyModels() };
                         });
                     }
                     catch (Exception) { }
                     if (r == null) { dispatcher.BeginInvoke(new Action(AgyBusy)); return; }
-                    quota = r[0]; credits = r[1]; accEmail = accounts[0];
+                    quota = r[0]; credits = r[1]; modelsText = r[2]; accEmail = accounts[0];
                 }
                 else
                 {
                     quota = RunAgy("/quota", out missing);
                     bool ignored;
                     credits = quota == null ? null : RunAgy("/credits", out ignored);
+                    modelsText = quota == null ? null : RunAgyModels();
                 }
                 // сеть пропала, пока agy работал, — его «нет входа» не верим
                 if (!missing && !NetUp()) { dispatcher.BeginInvoke(new Action(AgyOffline)); return; }
                 string email = accEmail ?? AgyAccounts.LiveEmail() ?? ReadAgyEmail();
-                dispatcher.BeginInvoke(new Action(() => FetchAgyDone(quota, credits, email, missing)));
+                dispatcher.BeginInvoke(new Action(() => FetchAgyDone(quota, credits, modelsText, email, missing)));
             });
         }
 
@@ -2700,7 +2872,7 @@ namespace AiLimitWidget
             UpdateView();
         }
 
-        void FetchAgyDone(string quota, string credits, string email, bool missing)
+        void FetchAgyDone(string quota, string credits, string modelsText, string email, bool missing)
         {
             agyFetching = false;
             UpdateSpin();
@@ -2712,8 +2884,9 @@ namespace AiLimitWidget
             SyncProviders();
             string problem = null;
             if (missing) { SetAgyStatus("", false); agyNextFetch = DateTime.Now.AddMinutes(10); }
-            else if (quota != null && ParseAgy(quota, out problem))
+            else if (quota != null && ParseAgy(quota, AgyModels.ParseList(modelsText).Count > 0 ? modelsText : agyModelsText, out problem))
             {
+                if (AgyModels.ParseList(modelsText).Count > 0) agyModelsText = modelsText;
                 agyUpdatedAt = DateTime.Now;
                 SetAgyStatus("", false);
                 ParseAgyCredits(credits);
@@ -2721,7 +2894,8 @@ namespace AiLimitWidget
                 try
                 {
                     File.WriteAllText(agyCachePath, json.Serialize(new Dictionary<string, object> {
-                        { "At", agyUpdatedAt.Value.ToString("o", Inv) }, { "Body", quota }, { "Credits", credits }, { "Email", agyEmail } }), new UTF8Encoding(false));
+                        { "At", agyUpdatedAt.Value.ToString("o", Inv) }, { "Body", quota }, { "Credits", credits }, { "Email", agyEmail },
+                        { "Models", agyModelsText } }), new UTF8Encoding(false));
                 }
                 catch (Exception) { }
                 CheckNotifications();
@@ -2744,10 +2918,13 @@ namespace AiLimitWidget
             return (name ?? key).Replace(" Models", "").Replace(" models", "").Replace(" and ", " и ");
         }
 
-        bool ParseAgy(string text, out string problem)
+        string agyModelsText;   // последний ответ «agy models» основного аккаунта
+
+        bool ParseAgy(string text, string modelsText, out string problem)
         {
             var list = AgyGroupsOf(text, out problem);
             if (list == null) return false;
+            AgyModels.Attach(list, modelsText);
             agyGroups.Clear();
             agyGroups.AddRange(list);
             RememberAgyKeys();
@@ -2851,7 +3028,8 @@ namespace AiLimitWidget
                 if (!File.Exists(agyCachePath)) return;
                 var d = json.DeserializeObject(File.ReadAllText(agyCachePath, Encoding.UTF8)) as Dictionary<string, object>;
                 string problem;
-                if (ParseAgy(Convert.ToString(Get(d, "Body"), Inv), out problem))
+                agyModelsText = Convert.ToString(Get(d, "Models"), Inv);
+                if (ParseAgy(Convert.ToString(Get(d, "Body"), Inv), agyModelsText, out problem))
                     agyUpdatedAt = DateTime.Parse(Convert.ToString(Get(d, "At"), Inv), Inv, DateTimeStyles.RoundtripKind);
                 ParseAgyCredits(Convert.ToString(Get(d, "Credits"), Inv));
                 agyEmail = Convert.ToString(Get(d, "Email"), Inv);
@@ -3786,6 +3964,31 @@ namespace AiLimitWidget
 
         UIElement AgyRow(AgyGroup g, DateTime now) { return AgyRow(g, now, false); }
 
+        // модели группы плашками: «Gemini 4 Argon  low · medium · high», новая — с зелёной меткой NEW
+        UIElement ModelChips(AgyGroup g)
+        {
+            var wrap = new WrapPanel { Margin = new Thickness(12, 2, 0, 0) };
+            foreach (var m in g.ModelList.OrderByDescending(x => x.IsNew))
+            {
+                var row = new StackPanel { Orientation = Orientation.Horizontal };
+                row.Children.Add(new TextBlock { Text = m.Name, FontSize = 11, Foreground = B(m.IsNew ? "#F2F2F7" : "#C7C7CC"), VerticalAlignment = VerticalAlignment.Center });
+                if (m.Levels.Count > 0)
+                    row.Children.Add(new TextBlock { Text = "  " + string.Join(" · ", m.Levels), FontSize = 10.5, Foreground = B("#8E8E93"), VerticalAlignment = VerticalAlignment.Center });
+                if (m.IsNew)
+                    row.Children.Add(new Border { Background = B("#30D158"), CornerRadius = new CornerRadius(3), Padding = new Thickness(4, 0, 4, 0), Margin = new Thickness(6, 0, 0, 0),
+                                                  VerticalAlignment = VerticalAlignment.Center,
+                                                  Child = new TextBlock { Text = "NEW", FontSize = 9, FontWeight = FontWeights.Bold, Foreground = B("#0B0B0C") } });
+                var chip = new Border { Child = row, CornerRadius = new CornerRadius(4), Padding = new Thickness(6, 1, 6, 2), Margin = new Thickness(0, 3, 5, 0),
+                                        Background = B(m.IsNew ? "#2630D158" : "#1FFFFFFF") };
+                string tip = m.Name + (m.Levels.Count > 0 ? " — уровни: " + string.Join(", ", m.Levels) : "");
+                if (m.IsNew) tip += "\nНовая модель: появилась в Antigravity за последние 7 дней";
+                if (m.NoOwnGroup) tip += "\nСвоей строки лимита в Antigravity у модели нет — поэтому показана в «" + g.Title + "»";
+                chip.ToolTip = tip;
+                wrap.Children.Add(chip);
+            }
+            return wrap;
+        }
+
         // lighter — группа второго аккаунта: тот же вид, цвет светлее
         UIElement AgyRow(AgyGroup g, DateTime now, bool lighter)
         {
@@ -3799,7 +4002,7 @@ namespace AiLimitWidget
             var title = new TextBlock { Text = g.Title, FontSize = 12.5, Foreground = B("#D1D1D6") };
             Grid.SetColumn(title, 1);
             head.Children.Add(title);
-            if (!string.IsNullOrEmpty(g.Models))
+            if (g.ModelList.Count == 0 && !string.IsNullOrEmpty(g.Models))   // список моделей ещё не получен — подпись из /quota
             {
                 var models = new TextBlock { Text = g.Models, FontSize = 11, Foreground = B("#636366"), Margin = new Thickness(6, 0, 0, 0),
                                              VerticalAlignment = VerticalAlignment.Bottom, TextTrimming = TextTrimming.CharacterEllipsis };
@@ -3807,6 +4010,7 @@ namespace AiLimitWidget
                 head.Children.Add(models);
             }
             panel.Children.Add(head);
+            if (g.ModelList.Count > 0) panel.Children.Add(ModelChips(g));
 
             var cols = new Grid { Margin = new Thickness(0, 3, 0, 0) };
             cols.ColumnDefinitions.Add(new ColumnDefinition());

@@ -820,7 +820,7 @@ namespace AiLimitWidget
             }
             try
             {
-                string live = AgyAccounts.IsAdding ? MainAgyEmail : (AgyAccounts.LiveEmail() ?? MainAgyEmail);
+                string live = AgyAccounts.IsAdding ? MainAgyEmail : (AgyAccounts.MainEmail() ?? MainAgyEmail);
                 var saved = AgyAccounts.Saved();
                 foreach (string email in saved)
                 {
@@ -1813,6 +1813,20 @@ namespace AiLimitWidget
 
         public static string LiveEmail() { return Email(Read(Live)); }
 
+        // почта основного входа: пока ace (или сам виджет) подставил вход другого аккаунта, прежняя почта лежит в account.restore.
+        // Без этого на время задачи ace подставленный аккаунт считался основным: основной раздел и раздел второго аккаунта
+        // показывали одну и ту же почту, а аккаунт, на котором идёт задача, пропадал
+        public static string MainEmail()
+        {
+            try
+            {
+                string e = File.Exists(Mark) ? File.ReadAllText(Mark).Trim() : null;
+                if (!string.IsNullOrEmpty(e)) return e;
+            }
+            catch (Exception) { }
+            return LiveEmail();
+        }
+
         public static void Remove(string email) { CredDeleteW(Prefix + email, 1, 0); }
 
         // блокировка, общая с ace; null — аккаунт занят дольше waitMs
@@ -2800,7 +2814,7 @@ namespace AiLimitWidget
                 }
                 // сеть пропала, пока agy работал, — его «нет входа» не верим
                 if (!missing && !NetUp()) { dispatcher.BeginInvoke(new Action(AgyOffline)); return; }
-                string email = accEmail ?? AgyAccounts.LiveEmail() ?? ReadAgyEmail();
+                string email = accEmail ?? AgyAccounts.MainEmail() ?? ReadAgyEmail();
                 dispatcher.BeginInvoke(new Action(() => FetchAgyDone(quota, credits, modelsText, email, missing)));
             });
         }
